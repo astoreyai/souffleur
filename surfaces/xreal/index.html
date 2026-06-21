@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Souffleur — XREAL</title>
+<style>
+  /* Tuned for a birdbath lens (XREAL Air) viewed at arm's length: TRUE BLACK
+     background minimizes light leak; one large, high-contrast cue dominates;
+     no scrolling, no chrome. It's a plain Coach Protocol WS client — XREAL Air
+     is just a USB-C monitor, so there is no SDK. */
+  :root {
+    --fact:#54d167; --question:#6cb6ff; --objection:#ffa24d; --cue:#cf9cff;
+    --recover:#ff6b63; --note:#aeb6c2; --them:#cdd6e4; --me:#9cc2ff;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; background: #000; color: #fff; overflow: hidden;
+    font: 16px/1.3 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-user-select: none; user-select: none; }
+  #stage { height: 100%; display: flex; flex-direction: column; padding: 4vh 6vw; }
+  #dot { position: fixed; top: 2.5vh; right: 2.5vw; width: 12px; height: 12px;
+    border-radius: 50%; background: #3a4150; transition: background .3s; }
+  #dot.on { background: var(--fact); box-shadow: 0 0 10px var(--fact); }
+
+  /* the dominant cue */
+  #cuewrap { flex: 1; display: flex; flex-direction: column; justify-content: center;
+    align-items: center; text-align: center; gap: 1.5vh; }
+  #kind { font-size: clamp(13px, 1.8vw, 22px); letter-spacing: .18em; text-transform: uppercase;
+    color: var(--note); font-weight: 700; opacity: 0; transition: opacity .3s; }
+  #kind.k { opacity: .9; }
+  #cue { font-size: clamp(34px, 5.2vw, 76px); font-weight: 800; line-height: 1.12;
+    max-width: 92%; text-shadow: 0 2px 18px rgba(0,0,0,.9); transition: opacity .3s; }
+  #cue.fade { opacity: .18; }
+  /* kind accent on the cue */
+  #kind.fact{color:var(--fact)} #kind.question{color:var(--question)} #kind.objection{color:var(--objection)}
+  #kind.cue{color:var(--cue)} #kind.recover{color:var(--recover)} #kind.note{color:var(--note)}
+
+  /* a single dim transcript tail line */
+  #tail { text-align: center; font-size: clamp(15px, 1.9vw, 26px); color: #7f8a9b;
+    min-height: 1.4em; max-width: 96%; margin: 0 auto; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; }
+  #tail b { color: #4a5263; font-weight: 600; margin-right: .5em; font-size: .8em; text-transform: uppercase; letter-spacing: .08em; }
+  #hint { text-align:center; color:#39414f; font-size: clamp(13px,1.6vw,20px); }
+</style>
+</head>
+<body>
+  <span id="dot"></span>
+  <div id="stage">
+    <div id="cuewrap">
+      <div id="kind"></div>
+      <div id="cue"><span id="hint">waiting for the coach…</span></div>
+    </div>
+    <div id="tail"></div>
+  </div>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const params = new URLSearchParams(location.search);
+  const h = location.hostname;
+  const host = (h && h !== "localhost" && !h.includes("tauri")) ? h : "127.0.0.1";
+  const wsUrl = params.get("ws") || `ws://${host}:8123`;
+
+  const dot = $("dot"), kindEl = $("kind"), cueEl = $("cue"), tailEl = $("tail");
+  let fadeTimer = null;
+
+  function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
+
+  function showCue(kind, text, ttlMs) {
+    const k = (kind || "note").toLowerCase();
+    kindEl.className = "k " + k;
+    kindEl.textContent = k;
+    cueEl.classList.remove("fade");
+    cueEl.textContent = text;
+    if (fadeTimer) clearTimeout(fadeTimer);
+    // Keep the cue legible, then dim it (don't blank it — a faded last cue is
+    // better than an empty lens) after its ttl.
+    fadeTimer = setTimeout(() => cueEl.classList.add("fade"), Math.max(4000, ttlMs || 12000));
+  }
+
+  function showTail(speaker, text) {
+    const who = String(speaker).startsWith("me") ? "you" : "them";
+    tailEl.innerHTML = `<b>${who}</b>${esc(text)}`;
+  }
+
+  function handle(ev) {
+    switch (ev.type) {
+      case "prompt": showCue(ev.kind, ev.text, ev.ttl_ms); break;
+      case "transcript.final": showTail(ev.speaker, ev.text); break;
+      case "state": dot.classList.toggle("on", ev.capturing !== false); break;
+      case "error":
+        dot.classList.remove("on");
+        showCue("note", ev.message || ev.code || "error", 6000);
+        break;
+    }
+  }
+
+  let sock;
+  function connect() {
+    sock = new WebSocket(wsUrl);
+    sock.onopen = () => dot.classList.add("on");
+    sock.onclose = () => { dot.classList.remove("on"); setTimeout(connect, 1500); };
+    sock.onerror = () => sock.close();
+    sock.onmessage = (m) => { try { handle(JSON.parse(m.data)); } catch (e) {} };
+  }
+  connect();
+})();
+</script>
+</body>
+</html>
