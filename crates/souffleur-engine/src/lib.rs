@@ -12,6 +12,7 @@
 //! `ws-tap` is a minimal client surface.
 
 pub mod audio;
+pub mod corpus;
 pub mod resample;
 pub mod source;
 pub mod stream;

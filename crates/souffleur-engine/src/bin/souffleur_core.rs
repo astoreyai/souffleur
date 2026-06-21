@@ -51,6 +51,7 @@ struct Config {
     suggest_model: Option<String>,
     wait_surface: bool,
     token: Option<String>,
+    corpus: Option<String>,
 }
 
 /// Shared daemon state read by the heartbeat and written by capture/consent paths.
@@ -91,6 +92,7 @@ fn parse_args() -> Result<Option<Config>> {
     let mut allow_cloud = false;
     let mut wait_surface = false;
     let mut listen_lan = false;
+    let mut corpus: Option<String> = None;
     let mut token: Option<String> = std::env::var("SOUFFLEUR_TOKEN")
         .ok()
         .filter(|s| !s.is_empty());
@@ -120,6 +122,7 @@ fn parse_args() -> Result<Option<Config>> {
             "--wait-surface" => wait_surface = true,
             "--listen-lan" => listen_lan = true,
             "--token" => token = Some(args.next().context("--token")?),
+            "--corpus" => corpus = Some(args.next().context("--corpus")?),
             other => return Err(anyhow!("unknown arg: {other}")),
         }
     }
@@ -173,6 +176,7 @@ fn parse_args() -> Result<Option<Config>> {
         suggest_model,
         wait_surface,
         token,
+        corpus,
     }))
 }
 
@@ -482,7 +486,18 @@ async fn main() -> Result<()> {
     } else {
         match make_backend(&cfg.suggest_backend, cfg.suggest_model.clone()) {
             Ok(backend) => {
-                let engine = SuggestionEngine::new(backend, SuggestConfig::default());
+                let mut engine = SuggestionEngine::new(backend, SuggestConfig::default());
+                if let Some(dir) = &cfg.corpus {
+                    let corpus =
+                        souffleur_engine::corpus::Corpus::ingest(std::path::Path::new(dir))
+                            .with_context(|| format!("ingest --corpus {dir}"))?;
+                    eprintln!(
+                        "[corpus] {} chunks from {} files in {dir} (cues will be grounded in your documents)",
+                        corpus.len(),
+                        corpus.sources()
+                    );
+                    engine.set_corpus(corpus);
+                }
                 let bname = engine.backend_name().to_string();
                 let is_cloud = engine.is_cloud();
                 match engine.check() {

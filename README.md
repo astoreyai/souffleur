@@ -88,8 +88,26 @@ Local Ollama is the default and keeps audio on the machine. To use a cloud LLM y
 
 ```bash
 GEMINI_API_KEY=... cargo run --bin souffleur-core -- --suggest-backend gemini --allow-cloud
-# backends: local (default) | gemini | claude | openai
+# backends: local (default) | gemini | claude | haiku | openai
+# `haiku` = Claude Haiku via the Anthropic API (cheapest Claude tier, BYO ANTHROPIC_API_KEY).
 ```
+
+### Grounded coaching from your own documents (RAG)
+
+Point the core at a folder of your material (dissertation chapters, interview prep, notes) and cues
+get grounded in it. Files (`.md`/`.txt`/`.text`/`.tex`) are chunked and embedded **locally** with
+Ollama `nomic-embed-text` (on-device, zero cost); on each confirmed transcript the recent context
+retrieves the top-k chunks, which are injected into the suggestion prompt so the coach can cite your
+documents (e.g. *"Per [methods.tex]: N=412"*).
+
+```bash
+cargo run --bin souffleur-core -- --mode duplex --corpus ~/dissertation
+```
+
+Privacy: the corpus stays on the machine with the local backend. With a cloud backend the retrieved
+text is transmitted too, so it rides the same consent gate as the transcript. Grounding quality
+tracks the generation model — a capable model (Haiku/Gemini, or local `qwen2.5:32b`) cites retrieved
+facts more reliably than `qwen3:8b`.
 
 ## Layout
 

@@ -12,6 +12,7 @@
 //! No mock backend exists (no-stub rule): a cloud backend with no API key fails
 //! closed at construction.
 
+use crate::corpus::Corpus;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -46,7 +47,9 @@ kind is one of: fact, question, objection, cue, recover, note. text is at most 1
 words, directly usable by ME in the moment (a fact to recall, a question to ask, \
 an objection rebuttal, a next-line cue). priority is 1-5 (5=urgent). Suggest only \
 when genuinely useful; return {\"prompts\":[]} when nothing helps. Never invent \
-facts not supported by the transcript.";
+facts not supported by the transcript. If a RELEVANT MATERIAL block from the \
+user's own documents precedes the transcript, prefer grounding facts in it and \
+cite the source in brackets, e.g. text \"Per [thesis.tex]: N=412\".";
 
 fn user_prompt(transcript: &str) -> String {
     format!("Transcript so far:\n{transcript}\n\nCoach ME now. Respond with only the JSON object.")
@@ -381,10 +384,15 @@ pub fn make_backend(kind: &str, model: Option<String>) -> Result<Box<dyn Suggest
         "claude" | "anthropic" => Box::new(AnthropicBackend::from_env(
             model.unwrap_or_else(|| "claude-opus-4-8".into()),
         )?),
+        // Convenience alias: Claude Haiku via the Anthropic API (fast, per-token
+        // billed, BYO ANTHROPIC_API_KEY). The cheapest Claude tier for cue work.
+        "haiku" => Box::new(AnthropicBackend::from_env(
+            model.unwrap_or_else(|| "claude-haiku-4-5".into()),
+        )?),
         "openai" => Box::new(OpenAiBackend::from_env(
             model.unwrap_or_else(|| "gpt-4o-mini".into()),
         )?),
-        other => bail!("unknown suggest backend: {other} (local|gemini|claude|openai)"),
+        other => bail!("unknown suggest backend: {other} (local|gemini|claude|haiku|openai)"),
     })
 }
 
@@ -496,6 +504,8 @@ pub struct SuggestionEngine {
     cfg: SuggestConfig,
     context: Vec<(String, String)>,
     pid: u32,
+    corpus: Option<Corpus>,
+    retrieve_k: usize,
 }
 
 impl SuggestionEngine {
@@ -505,7 +515,15 @@ impl SuggestionEngine {
             cfg,
             context: Vec::new(),
             pid: 0,
+            corpus: None,
+            retrieve_k: 3,
         }
+    }
+
+    /// Attach a retrieval corpus; cues are then grounded in the top-k chunks most
+    /// similar to the recent transcript (RAG).
+    pub fn set_corpus(&mut self, corpus: Corpus) {
+        self.corpus = Some(corpus);
     }
 
     pub fn backend_name(&self) -> &str {
@@ -539,13 +557,25 @@ impl SuggestionEngine {
     }
 
     /// Run the backend on the current context and return any `prompt` events.
+    /// When a corpus is attached, the recent transcript retrieves the top-k most
+    /// similar chunks, which are prepended as a RELEVANT MATERIAL block so the
+    /// backend can ground cues in the user's documents. Retrieval failure (e.g.
+    /// the embedder is down) degrades gracefully to transcript-only.
     pub fn suggest(&mut self, session_ms: u64) -> Result<(Vec<Event>, u64)> {
         if self.context.is_empty() {
             return Ok((Vec::new(), 0));
         }
-        let (content, latency) =
-            self.backend
-                .complete(SYSTEM_PROMPT, &self.transcript(), &self.cfg)?;
+        let transcript = self.transcript();
+        let user_content = match &self.corpus {
+            Some(c) => match c.context_block(&transcript, self.retrieve_k) {
+                Some(block) => format!("{block}\nCONVERSATION:\n{transcript}"),
+                None => transcript,
+            },
+            None => transcript,
+        };
+        let (content, latency) = self
+            .backend
+            .complete(SYSTEM_PROMPT, &user_content, &self.cfg)?;
         let evs = parse_prompts(&content, &mut self.pid, session_ms)?;
         Ok((evs, latency))
     }
