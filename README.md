@@ -36,13 +36,17 @@ cargo build
 cargo test --workspace        # offline + device-free; no model or network needed
 ```
 
-CI runs on GitHub Actions (`.github/workflows/ci.yml`): fmt, clippy `-D warnings`, the full
-test suite, and an MSRV check. To run the identical gate locally before pushing:
+The CI gate is fmt, clippy `-D warnings`, the full test suite, and an MSRV check. Run it
+locally with `scripts/ci.sh`:
 
 ```bash
-./scripts/ci.sh                          # fmt + clippy + test, same as CI
+./scripts/ci.sh                          # fmt + clippy + test, same checks as CI
 git config core.hooksPath .githooks      # optional: run it automatically on every push
 ```
+
+A GitHub Actions workflow (`.github/workflows/ci.yml`) runs the same gate, but is parked on
+`workflow_dispatch` (manual) because GitHub-hosted Actions are disabled on this account until
+its billing is in good standing. Re-enable the `push`/`pull_request` triggers there once it is.
 
 ### Run the core
 
