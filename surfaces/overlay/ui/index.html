@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Souffleur Overlay</title>
+<style>
+  :root {
+    --cue:#bc8cff; --fact:#3fb950; --question:#58a6ff; --objection:#f0883e; --recover:#f85149; --note:#8b949e;
+    --them:#b9c4d6; --me:#6ea8fe; --muted:#7b8699; --text:#eef2f8;
+    --hidden:#3fb950; --visible:#f0883e;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { background: transparent; overflow: hidden; height: 100%;
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: var(--text);
+    -webkit-user-select: none; user-select: none; }
+  /* the whole overlay is a draggable region in Tauri (when click-through is off) */
+  #wrap { padding: 10px; display: flex; flex-direction: column; gap: 8px; height: 100%; }
+
+  .bar { display: flex; align-items: center; gap: 8px; padding: 5px 9px;
+    background: rgba(13,16,22,.82); border: 1px solid rgba(255,255,255,.07); border-radius: 10px;
+    backdrop-filter: blur(8px); -webkit-app-region: drag; }
+  .name { font-weight: 700; letter-spacing: .2px; font-size: 12px; }
+  .name small { color: var(--muted); font-weight: 400; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: #4b5566; }
+  .dot.on { background: var(--fact); box-shadow: 0 0 6px var(--fact); }
+  /* honest screen-share badge */
+  .badge { margin-left: auto; font-size: 10.5px; font-weight: 600; padding: 2px 7px; border-radius: 999px;
+    display: flex; align-items: center; gap: 5px; }
+  .badge .b { width: 6px; height: 6px; border-radius: 50%; }
+  .badge.hidden { color: var(--hidden); background: rgba(63,185,80,.13); } .badge.hidden .b { background: var(--hidden); }
+  .badge.visible { color: var(--visible); background: rgba(240,136,62,.14); } .badge.visible .b { background: var(--visible); }
+
+  #prompts { display: flex; flex-direction: column; gap: 6px; }
+  .chip { background: rgba(20,24,34,.88); border: 1px solid rgba(255,255,255,.07); border-left: 3px solid var(--note);
+    border-radius: 10px; padding: 8px 11px; backdrop-filter: blur(8px); animation: pop .16s ease-out; }
+  .chip .k { font-size: 9.5px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
+  .chip .t { font-size: 15px; font-weight: 600; line-height: 1.25; margin-top: 1px; }
+  .chip.fact{border-left-color:var(--fact)} .chip.question{border-left-color:var(--question)}
+  .chip.objection{border-left-color:var(--objection)} .chip.cue{border-left-color:var(--cue)}
+  .chip.recover{border-left-color:var(--recover)} .chip.note{border-left-color:var(--note)}
+  .chip.fade { opacity: 0; transform: translateY(-4px); transition: .4s; }
+  @keyframes pop { from { opacity: 0; transform: translateY(4px);} to { opacity:1; transform:none;} }
+
+  #tail { margin-top: auto; display: flex; flex-direction: column; gap: 3px;
+    background: rgba(13,16,22,.72); border: 1px solid rgba(255,255,255,.06); border-radius: 10px; padding: 7px 9px; }
+  .ln { font-size: 12px; line-height: 1.3; }
+  .ln .w { font-size: 9px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); margin-right: 6px; }
+  .ln.them { color: var(--them); } .ln.me { color: var(--me); }
+  .ln.partial { opacity: .55; font-style: italic; }
+</style>
+</head>
+<body>
+  <div id="wrap">
+    <div class="bar">
+      <span class="dot" id="dot"></span>
+      <span class="name">Souffleur <small id="model"></small></span>
+      <span class="badge visible" id="badge"><span class="b"></span><span id="badge-text">checking…</span></span>
+    </div>
+    <div id="prompts"></div>
+    <div id="tail"><div class="ln them" id="placeholder"><span class="w">·</span>waiting for audio…</div></div>
+  </div>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const params = new URLSearchParams(location.search);
+  // In a Tauri webview location.hostname is "tauri.localhost"; fall back to loopback.
+  const h = location.hostname;
+  const host = (h && h !== "localhost" && !h.includes("tauri")) ? h : "127.0.0.1";
+  const wsUrl = params.get("ws") || `ws://${host}:8123`;
+  const dot = $("dot"), badge = $("badge"), badgeText = $("badge-text"), modelEl = $("model");
+  const promptsEl = $("prompts"), tailEl = $("tail");
+  const tailLines = []; const partials = { me: null, them: null };
+
+  function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
+  function sclass(s){return String(s).startsWith("me")?"me":"them";}
+
+  function pushTail(node){
+    const ph = $("placeholder"); if (ph) ph.remove();
+    tailEl.appendChild(node); tailLines.push(node);
+    while (tailLines.length > 3) tailLines.shift().remove();
+  }
+  function addFinal(speaker, text){
+    const cls = sclass(speaker);
+    if (partials[cls]) { partials[cls].remove(); partials[cls]=null; }
+    const el = document.createElement("div"); el.className = `ln ${cls}`;
+    el.innerHTML = `<span class="w">${cls==="me"?"you":"them"}</span>${esc(text)}`;
+    pushTail(el);
+  }
+  function showPartial(speaker, text){
+    const cls = sclass(speaker);
+    if (!partials[cls]) { const el=document.createElement("div"); el.className=`ln ${cls} partial`;
+      el.innerHTML=`<span class="w">${cls==="me"?"you":"them"}</span><span class="pt"></span>`; pushTail(el); partials[cls]=el; }
+    partials[cls].querySelector(".pt").textContent = text;
+  }
+  function addPrompt(p){
+    const kind=(p.kind||"note").toLowerCase();
+    const el=document.createElement("div"); el.className=`chip ${kind}`;
+    el.innerHTML=`<div class="k">${kind} · p${p.priority||3}</div><div class="t">${esc(p.text)}</div>`;
+    promptsEl.appendChild(el);
+    while (promptsEl.children.length>2) promptsEl.firstElementChild.remove();
+    const ttl=Math.max(3000,p.ttl_ms||12000);
+    setTimeout(()=>{el.classList.add("fade");setTimeout(()=>el.remove(),400);},ttl);
+  }
+  function handle(ev){
+    switch(ev.type){
+      case "transcript.partial": showPartial(ev.speaker, ev.text); break;
+      case "transcript.final": addFinal(ev.speaker, ev.text); break;
+      case "prompt": addPrompt(ev); break;
+      case "state": modelEl.textContent = ev.model?"· "+ev.model:""; dot.classList.add("on"); break;
+    }
+  }
+  let sock;
+  function connect(){
+    sock=new WebSocket(wsUrl);
+    sock.onopen=()=>dot.classList.add("on");
+    sock.onclose=()=>{dot.classList.remove("on"); setTimeout(connect,1500);};
+    sock.onerror=()=>sock.close();
+    sock.onmessage=(m)=>{try{handle(JSON.parse(m.data));}catch(e){}};
+  }
+  connect();
+
+  // Honest screen-share badge: ask the Tauri host for the real capability.
+  async function captureStatus(){
+    if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) {
+      try { return await window.__TAURI__.core.invoke("capture_status"); } catch(e){}
+    }
+    const cap = params.get("cap");
+    if (cap === "windows") return { os:"windows", hidden:true, note:"excluded via WDA_EXCLUDEFROMCAPTURE" };
+    if (cap === "macos")   return { os:"macos",   hidden:false, note:"ScreenCaptureKit ignores exclusion (macOS 15+)" };
+    if (cap === "linux")   return { os:"linux",   hidden:false, note:"no per-window capture-exclusion API" };
+    return { os:"browser", hidden:false, note:"browser preview" };
+  }
+  captureStatus().then((c)=>{
+    if (c.hidden){ badge.className="badge hidden"; badgeText.textContent="hidden on screen-share"; }
+    else { badge.className="badge visible"; badgeText.textContent = c.os==="browser" ? "preview" : "VISIBLE on screen-share"; }
+    badge.title = `${c.os}: ${c.note}`;
+  });
+})();
+</script>
+</body>
+</html>

@@ -4,6 +4,10 @@ members = [
     "crates/souffleur-protocol",
     "crates/souffleur-engine",
 ]
+# The Tauri overlay app is an independent crate (heavy webkit deps); built on its own.
+exclude = [
+    "surfaces/overlay/src-tauri",
+]
 
 [workspace.package]
 version = "0.0.0"

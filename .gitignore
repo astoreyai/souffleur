@@ -54,3 +54,7 @@ Thumbs.db
 # --- Local scratch ---
 scratch/
 tmp/
+
+# Tauri build artifacts
+surfaces/overlay/src-tauri/target/
+surfaces/overlay/src-tauri/gen/
