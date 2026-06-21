@@ -1,7 +1,9 @@
-# Open-Source Real-Time Conversation Coach — Architecture & Implementation Plan
+# Souffleur — Architecture & Implementation Plan
 
-Date: 2026-06-21. Working name: **whispercoach** (public name TBD — see §10).
+Date: 2026-06-21. Project name: **Souffleur**.
 Source research: `docs/research/01..04`. This plan synthesizes those four cited landscape reports.
+
+**Settled decisions (2026-06-21):** License **AGPL-3.0** · Inference **local-only default, cloud opt-in (BYO-key, consent-gated)** · Core **Rust/Tauri from day one** · Name **Souffleur**. See §10 for the log.
 
 ---
 
@@ -102,9 +104,10 @@ Each pick leads with the recommendation, then the alternative it beats and why (
 - **Smart glasses** — **MentraOS** TypeScript cloud app (MIT; one app → Even Realities G1/G2, Vuzix Z100, Mentra Mach1; gives a `TRANSCRIPTION` stream in and `showTextWall()` out; 300 ms display floor → coalesce to ≤3 updates/s) as primary; **Brilliant Labs Frame** Python/BLE (`display.show_text`, PC-direct, no cloud) as the fully-open reference (research `04 §2–3`). Design for **1–5 short glanceable lines**, self-paginated.
 - **Desktop overlay** — Tauri window with `contentProtected:true`. Real invisibility on **Windows (build 19041+)**; on **macOS 15+ it does NOT hide** and on **Linux there's no API** — the UI states this honestly per-OS (research `02 §3`).
 
-### 3.5 Core language — **Python MVP behind the Coach Protocol seam, then harden capture/transport to Rust/Tauri**
-- Python first (RealtimeSTT/Moonshine + Ollama) to nail the latency/UX loop fast (simplest-thing-that-works). Because the **Coach Protocol seam is language-agnostic**, surfaces (TS glasses, web phone, Tauri overlay) don't care what the core is written in, so the later port carries no surface rework.
-- Beats Rust/Tauri-first: the best references (Hyprnote, Pluely, Screenpipe, Meetily) are Tauri/Rust and that's the right *distribution* target — but starting there slows the latency/UX validation that decides whether the whole thing is viable. Validate in Python, then port the hot path.
+### 3.5 Core language — **Rust / Tauri from day one** (settled decision)
+- Goes straight to the right distribution target — the strongest references all chose it: Hyprnote/Anarlog, Pluely, Screenpipe, Meetily, Vibe are all **Tauri/Rust** (research `02 §1–2`). One toolchain covers the cross-platform audio core (cpal / native CoreAudio taps / WASAPI / PipeWire), the overlay surface (`contentProtected`), and packaging.
+- **Accepted trade-off:** no throwaway Python prototype, so the latency/UX loop is validated *in* the production stack rather than ahead of it. **Mitigation — make the latency harness the very first Phase-0 deliverable** so the viability question (can the local Moonshine path hit < 1.3 s on real hardware?) is answered before the rest of the core is built on top.
+- Crate/tooling starting points: `cpal` (cross-platform audio I/O), `tauri` v2 (shell + overlay + `contentProtected`), `tokio` + `tokio-tungstenite` (Coach Protocol WebSocket), a Rust binding to whisper.cpp/Moonshine (FFI or `whisper-rs`) for STT, and `llama.cpp`/Ollama over HTTP for the suggestion engine. Glasses (MentraOS) and phone (PWA) surfaces stay TypeScript/web behind the protocol seam — unaffected by the core language.
 
 ---
 
@@ -124,7 +127,7 @@ Target **< 2 s**; the **Moonshine local path is the only way to hit < 1.3 s full
 
 ## 5. Phased roadmap
 
-- **Phase 0 — Seam + capture spike.** Write the Coach Protocol spec. Python core: capture both sides (mic + loopback) on the primary dev OS, emit `transcript.partial/final`. Build the latency harness. *Exit:* both-sides transcript visible with measured capture→text latency.
+- **Phase 0 — Seam + capture spike (Rust).** Write the Coach Protocol spec. Rust core: capture both sides (mic + loopback, via `cpal`/native taps) on the primary dev OS, emit `transcript.partial/final` over the WebSocket. **Build the latency harness first** and confirm the local Moonshine path hits its target on real hardware. *Exit:* both-sides transcript visible with a measured speech→text latency number from the harness.
 - **Phase 1 — MVP coach (local, phone surface).** Add Moonshine STT + local Ollama GBNF suggestion engine + phone PWA surface. *Exit:* usable end-to-end coach on a real call, on-device, < 2 s, coaching on a second device (the robust invisibility).
 - **Phase 2 — Desktop overlay surface.** Tauri overlay with `contentProtected` + honest per-OS invisibility disclosure (Windows real; macOS/Linux labeled). *Exit:* overlay works on a Windows screen-share with documented limits.
 - **Phase 3 — Smart glasses.** MentraOS TS surface consuming the protocol (or its `TRANSCRIPTION` stream); Frame Python reference. *Exit:* live prompts on real glasses; measure on-hardware chars/line + end-to-end latency (the two undocumented unknowns, research `04 §4`).
@@ -169,9 +172,9 @@ From research `02 §2`: **Natively** (most-engineered covert clone; local ONNX W
 
 ---
 
-## 10. Open decisions for the maintainer (recommendation first)
+## 10. Decisions log (settled 2026-06-21)
 
-1. **License — recommend AGPL-3.0.** Prevents a closed-SaaS fork (the exact move Cluely/Interview Coder pulled), fits the anti-paywalled-stealth ethos, and is compatible with studying the AGPL references. *Alt:* Apache-2.0 for max adoption (but permits closed commercial forks); GPL-3.0 (copyleft without the network clause).
-2. **Default inference — recommend local-only, cloud as opt-in BYO-key.** Privacy posture is the product's whole legal/ethical edge. *Alt:* cloud-default for best latency/quality (but reintroduces the wiretapping exposure).
-3. **Core language — recommend Python MVP → Rust/Tauri port behind the protocol seam.** Fastest path to validate the latency/UX that decides viability. *Alt:* Rust/Tauri from day one (right distribution target, slower to validate).
-4. **Public name — recommend something off "Whisper"** (trademark of WhisperCoach + collision with OpenAI Whisper). Candidates: **Souffleur** (the theatre prompter who whispers lines — most on-theme), **Sotto** (sotto voce), **Cue**, **Aside**, **Murmur**, **Cuepilot**. *Working dir stays `whispercoach` until chosen.*
+1. **License → AGPL-3.0.** Prevents a closed-SaaS fork (the exact move Cluely/Interview Coder pulled), fits the anti-paywalled-stealth ethos, compatible with studying the AGPL references. (`LICENSE` added.) *Considered:* Apache-2.0 (max adoption but permits closed forks), GPL-3.0 (copyleft without the network clause).
+2. **Default inference → local-only, cloud opt-in (BYO-key, consent-gated).** The on-device privacy posture is the product's whole legal/ethical edge. *Considered:* cloud-default (best latency/quality, but reintroduces the wiretapping/BIPA exposure).
+3. **Core stack → Rust/Tauri from day one.** Straight to the distribution target the best references all use; accepted trade-off is validating latency/UX in the production stack, mitigated by building the latency harness first (see §3.5). *Considered:* Python MVP → Rust port (faster to validate, but throwaway).
+4. **Name → Souffleur.** The theatre prompter who whispers an actor's lines — on-theme, avoids the WhisperCoach trademark and the OpenAI-Whisper collision. Working directory renamed `whispercoach` → `souffleur`. *Considered:* Sotto, Cue/Cuepilot, Aside, Murmur.
