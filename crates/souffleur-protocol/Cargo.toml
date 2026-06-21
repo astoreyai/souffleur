@@ -3,6 +3,7 @@ name = "souffleur-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "Coach Protocol v0 — the core<->surface event contract for Souffleur"
 
 [dependencies]

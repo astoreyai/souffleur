@@ -174,7 +174,13 @@ impl StreamingStt {
         let stt_ms = started.elapsed().as_millis() as u64;
 
         let cut = dur.saturating_sub(self.cfg.hold_ms);
-        let commit = decide_commit(&tr.segments, &self.prev_abs, self.base_ms, cut, self.cfg.agree_tol_ms);
+        let commit = decide_commit(
+            &tr.segments,
+            &self.prev_abs,
+            self.base_ms,
+            cut,
+            self.cfg.agree_tol_ms,
+        );
 
         // Record THIS run for the next agreement check, in absolute time (using the
         // pre-trim base_ms, since this transcription was of the pre-trim buffer).
@@ -267,7 +273,11 @@ mod tests {
     use super::*;
 
     fn seg(text: &str, t0: i64, t1: i64) -> Segment {
-        Segment { text: text.into(), t0_ms: t0, t1_ms: t1 }
+        Segment {
+            text: text.into(),
+            t0_ms: t0,
+            t1_ms: t1,
+        }
     }
 
     #[test]
@@ -288,7 +298,11 @@ mod tests {
         // prev run saw hello@1000 and world@2000 (absolute). This run: hello, world
         // both behind the 2500ms cut and agreed; "there"@3000 is past the cut.
         let prev = vec![("hello".to_string(), 1000), ("world".to_string(), 2000)];
-        let segs = [seg("hello", 0, 1000), seg("world", 1000, 2000), seg("there", 2000, 3000)];
+        let segs = [
+            seg("hello", 0, 1000),
+            seg("world", 1000, 2000),
+            seg("there", 2000, 3000),
+        ];
         let c = decide_commit(&segs, &prev, 0, 2500, 500);
         assert_eq!(c.text, "hello world");
         assert_eq!(c.t1_ms, 2000);
@@ -300,7 +314,11 @@ mod tests {
         // S1 stable, S2 NOT in prev (flickering), S3 in prev. The prefix must STOP
         // at S2 — S3 must NOT be committed (which would trim away S2's audio).
         let prev = vec![("one".to_string(), 1000), ("three".to_string(), 3000)];
-        let segs = [seg("one", 0, 1000), seg("two", 1000, 2000), seg("three", 2000, 3000)];
+        let segs = [
+            seg("one", 0, 1000),
+            seg("two", 1000, 2000),
+            seg("three", 2000, 3000),
+        ];
         let c = decide_commit(&segs, &prev, 0, 5000, 500);
         assert_eq!(c.text, "one");
         assert_eq!(c.t1_ms, 1000);
@@ -331,7 +349,11 @@ mod tests {
     #[test]
     fn nonspeech_marker_does_not_break_the_prefix() {
         let prev = vec![("hi".to_string(), 1000), ("bye".to_string(), 3000)];
-        let segs = [seg("hi", 0, 1000), seg("[BLANK_AUDIO]", 1000, 2000), seg("bye", 2000, 3000)];
+        let segs = [
+            seg("hi", 0, 1000),
+            seg("[BLANK_AUDIO]", 1000, 2000),
+            seg("bye", 2000, 3000),
+        ];
         let c = decide_commit(&segs, &prev, 0, 5000, 500);
         assert_eq!(c.text, "hi bye");
         assert_eq!(c.t1_ms, 3000);

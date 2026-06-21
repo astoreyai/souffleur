@@ -68,7 +68,12 @@ pub trait SuggestBackend: Send {
     fn warmup(&self) -> Result<u64> {
         Ok(0)
     }
-    fn complete(&self, system: &str, transcript: &str, cfg: &SuggestConfig) -> Result<(String, u64)>;
+    fn complete(
+        &self,
+        system: &str,
+        transcript: &str,
+        cfg: &SuggestConfig,
+    ) -> Result<(String, u64)>;
 }
 
 /// Local Ollama backend (`/api/chat`, JSON mode). On-device; not cloud.
@@ -101,10 +106,17 @@ impl SuggestBackend for OllamaBackend {
         let body: Value = resp.into_json().context("parse /api/tags")?;
         let have = body["models"]
             .as_array()
-            .map(|a| a.iter().any(|m| m["name"].as_str() == Some(self.model.as_str())))
+            .map(|a| {
+                a.iter()
+                    .any(|m| m["name"].as_str() == Some(self.model.as_str()))
+            })
             .unwrap_or(false);
         if !have {
-            bail!("ollama model {:?} not pulled (try `ollama pull {}`)", self.model, self.model);
+            bail!(
+                "ollama model {:?} not pulled (try `ollama pull {}`)",
+                self.model,
+                self.model
+            );
         }
         Ok(())
     }
@@ -121,7 +133,12 @@ impl SuggestBackend for OllamaBackend {
             .context("ollama warmup")?;
         Ok(started.elapsed().as_millis() as u64)
     }
-    fn complete(&self, system: &str, transcript: &str, cfg: &SuggestConfig) -> Result<(String, u64)> {
+    fn complete(
+        &self,
+        system: &str,
+        transcript: &str,
+        cfg: &SuggestConfig,
+    ) -> Result<(String, u64)> {
         let req = json!({
             "model": self.model, "stream": false, "think": false, "format": "json",
             "options": { "temperature": cfg.temperature, "num_predict": cfg.num_predict },
@@ -136,7 +153,10 @@ impl SuggestBackend for OllamaBackend {
             .send_json(req)
             .context("ollama /api/chat")?;
         let v: Value = resp.into_json().context("parse chat response")?;
-        let content = v["message"]["content"].as_str().unwrap_or_default().to_string();
+        let content = v["message"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         Ok((content, started.elapsed().as_millis() as u64))
     }
 }
@@ -153,7 +173,10 @@ impl GeminiBackend {
             .ok()
             .filter(|k| !k.is_empty())
             .ok_or_else(|| anyhow!("GEMINI_API_KEY not set"))?;
-        Ok(Self { model: model.into(), key })
+        Ok(Self {
+            model: model.into(),
+            key,
+        })
     }
 }
 
@@ -172,7 +195,12 @@ impl SuggestBackend for GeminiBackend {
             .context("gemini models list (is GEMINI_API_KEY valid?)")?;
         Ok(())
     }
-    fn complete(&self, system: &str, transcript: &str, cfg: &SuggestConfig) -> Result<(String, u64)> {
+    fn complete(
+        &self,
+        system: &str,
+        transcript: &str,
+        cfg: &SuggestConfig,
+    ) -> Result<(String, u64)> {
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
             self.model
@@ -216,7 +244,10 @@ impl AnthropicBackend {
             .ok()
             .filter(|k| !k.is_empty())
             .ok_or_else(|| anyhow!("ANTHROPIC_API_KEY not set"))?;
-        Ok(Self { model: model.into(), key })
+        Ok(Self {
+            model: model.into(),
+            key,
+        })
     }
 }
 
@@ -236,7 +267,12 @@ impl SuggestBackend for AnthropicBackend {
             .context("anthropic /v1/models (is ANTHROPIC_API_KEY valid?)")?;
         Ok(())
     }
-    fn complete(&self, system: &str, transcript: &str, cfg: &SuggestConfig) -> Result<(String, u64)> {
+    fn complete(
+        &self,
+        system: &str,
+        transcript: &str,
+        cfg: &SuggestConfig,
+    ) -> Result<(String, u64)> {
         let req = json!({
             "model": self.model,
             "max_tokens": cfg.num_predict.max(256),
@@ -275,8 +311,13 @@ impl OpenAiBackend {
             .ok()
             .filter(|k| !k.is_empty())
             .ok_or_else(|| anyhow!("OPENAI_API_KEY not set"))?;
-        let base = std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
-        Ok(Self { model: model.into(), key, base })
+        let base =
+            std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
+        Ok(Self {
+            model: model.into(),
+            key,
+            base,
+        })
     }
 }
 
@@ -295,7 +336,12 @@ impl SuggestBackend for OpenAiBackend {
             .context("openai /models (is OPENAI_API_KEY valid?)")?;
         Ok(())
     }
-    fn complete(&self, system: &str, transcript: &str, cfg: &SuggestConfig) -> Result<(String, u64)> {
+    fn complete(
+        &self,
+        system: &str,
+        transcript: &str,
+        cfg: &SuggestConfig,
+    ) -> Result<(String, u64)> {
         let req = json!({
             "model": self.model,
             "messages": [
@@ -313,7 +359,10 @@ impl SuggestBackend for OpenAiBackend {
             .send_json(req)
             .context("openai /chat/completions")?;
         let v: Value = resp.into_json().context("parse openai response")?;
-        let content = v["choices"][0]["message"]["content"].as_str().unwrap_or_default().to_string();
+        let content = v["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         Ok((content, started.elapsed().as_millis() as u64))
     }
 }
@@ -323,10 +372,18 @@ impl SuggestBackend for OpenAiBackend {
 /// default.
 pub fn make_backend(kind: &str, model: Option<String>) -> Result<Box<dyn SuggestBackend>> {
     Ok(match kind {
-        "local" | "ollama" => Box::new(OllamaBackend::new(model.unwrap_or_else(|| "qwen3:8b".into()))),
-        "gemini" => Box::new(GeminiBackend::from_env(model.unwrap_or_else(|| "gemini-2.5-flash".into()))?),
-        "claude" | "anthropic" => Box::new(AnthropicBackend::from_env(model.unwrap_or_else(|| "claude-opus-4-8".into()))?),
-        "openai" => Box::new(OpenAiBackend::from_env(model.unwrap_or_else(|| "gpt-4o-mini".into()))?),
+        "local" | "ollama" => Box::new(OllamaBackend::new(
+            model.unwrap_or_else(|| "qwen3:8b".into()),
+        )),
+        "gemini" => Box::new(GeminiBackend::from_env(
+            model.unwrap_or_else(|| "gemini-2.5-flash".into()),
+        )?),
+        "claude" | "anthropic" => Box::new(AnthropicBackend::from_env(
+            model.unwrap_or_else(|| "claude-opus-4-8".into()),
+        )?),
+        "openai" => Box::new(OpenAiBackend::from_env(
+            model.unwrap_or_else(|| "gpt-4o-mini".into()),
+        )?),
         other => bail!("unknown suggest backend: {other} (local|gemini|claude|openai)"),
     })
 }
@@ -443,7 +500,12 @@ pub struct SuggestionEngine {
 
 impl SuggestionEngine {
     pub fn new(backend: Box<dyn SuggestBackend>, cfg: SuggestConfig) -> Self {
-        Self { backend, cfg, context: Vec::new(), pid: 0 }
+        Self {
+            backend,
+            cfg,
+            context: Vec::new(),
+            pid: 0,
+        }
     }
 
     pub fn backend_name(&self) -> &str {
@@ -460,7 +522,8 @@ impl SuggestionEngine {
     }
 
     pub fn push_turn(&mut self, speaker: &str, text: &str) {
-        self.context.push((speaker.to_uppercase(), text.to_string()));
+        self.context
+            .push((speaker.to_uppercase(), text.to_string()));
         let n = self.context.len();
         if n > self.cfg.max_turns {
             self.context.drain(..n - self.cfg.max_turns);
@@ -480,7 +543,9 @@ impl SuggestionEngine {
         if self.context.is_empty() {
             return Ok((Vec::new(), 0));
         }
-        let (content, latency) = self.backend.complete(SYSTEM_PROMPT, &self.transcript(), &self.cfg)?;
+        let (content, latency) =
+            self.backend
+                .complete(SYSTEM_PROMPT, &self.transcript(), &self.cfg)?;
         let evs = parse_prompts(&content, &mut self.pid, session_ms)?;
         Ok((evs, latency))
     }
@@ -488,7 +553,11 @@ impl SuggestionEngine {
     /// Like [`suggest`](Self::suggest), but a CLOUD backend refuses to transmit
     /// the transcript off-device unless consent has been disclosed. This is the
     /// enforced privacy chokepoint for the cloud tier.
-    pub fn suggest_gated(&mut self, session_ms: u64, consent_disclosed: bool) -> Result<(Vec<Event>, u64)> {
+    pub fn suggest_gated(
+        &mut self,
+        session_ms: u64,
+        consent_disclosed: bool,
+    ) -> Result<(Vec<Event>, u64)> {
         if self.is_cloud() && !consent_disclosed {
             return Ok((Vec::new(), 0));
         }
@@ -509,7 +578,10 @@ mod tests {
     #[test]
     fn extracts_balanced_object_ignoring_trailing_braces() {
         let s = "{\"prompts\":[{\"text\":\"hi\"}]} note: {x}";
-        assert_eq!(extract_json_object(s), Some("{\"prompts\":[{\"text\":\"hi\"}]}"));
+        assert_eq!(
+            extract_json_object(s),
+            Some("{\"prompts\":[{\"text\":\"hi\"}]}")
+        );
     }
 
     #[test]
@@ -525,7 +597,10 @@ mod tests {
 
     #[test]
     fn kind_mapping() {
-        assert!(matches!(parse_kind(&Some("OBJECTION".into())), PromptKind::Objection));
+        assert!(matches!(
+            parse_kind(&Some("OBJECTION".into())),
+            PromptKind::Objection
+        ));
         assert!(matches!(parse_kind(&None), PromptKind::Note));
     }
 
@@ -540,7 +615,11 @@ mod tests {
         .unwrap();
         assert_eq!(evs.len(), 1); // empty-text prompt dropped
         match &evs[0] {
-            Event::Prompt { prompt_id, priority, .. } => {
+            Event::Prompt {
+                prompt_id,
+                priority,
+                ..
+            } => {
                 assert_eq!(prompt_id, "p1");
                 assert_eq!(*priority, 5); // clamped from 9
             }
@@ -552,9 +631,15 @@ mod tests {
     /// stops a cloud call before any transcript leaves the machine.
     struct PanicCloud;
     impl SuggestBackend for PanicCloud {
-        fn name(&self) -> &str { "panic-cloud" }
-        fn is_cloud(&self) -> bool { true }
-        fn check(&self) -> Result<()> { Ok(()) }
+        fn name(&self) -> &str {
+            "panic-cloud"
+        }
+        fn is_cloud(&self) -> bool {
+            true
+        }
+        fn check(&self) -> Result<()> {
+            Ok(())
+        }
         fn complete(&self, _: &str, _: &str, _: &SuggestConfig) -> Result<(String, u64)> {
             panic!("cloud backend must not be called without consent");
         }
@@ -573,7 +658,10 @@ mod tests {
     fn context_truncates() {
         let mut e = SuggestionEngine::new(
             Box::new(OllamaBackend::new("m")),
-            SuggestConfig { max_turns: 2, ..Default::default() },
+            SuggestConfig {
+                max_turns: 2,
+                ..Default::default()
+            },
         );
         e.push_turn("me", "a");
         e.push_turn("them", "b");

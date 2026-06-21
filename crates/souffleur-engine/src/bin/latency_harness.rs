@@ -14,7 +14,10 @@ use std::time::Instant;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let model = args.get(1).map(String::as_str).unwrap_or("models/ggml-base.en.bin");
+    let model = args
+        .get(1)
+        .map(String::as_str)
+        .unwrap_or("models/ggml-base.en.bin");
     let wav = args.get(2).map(String::as_str).unwrap_or("assets/jfk.wav");
     let n_threads: i32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8);
     let runs: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(5);
@@ -79,11 +82,16 @@ fn main() -> Result<()> {
 
     println!("\n=== Souffleur Phase-0 latency harness ===");
     println!("model:        {}", stt.model_label());
-    println!("audio:        {wav}  ({audio_secs:.2}s, {} Hz src)", spec.sample_rate);
+    println!(
+        "audio:        {wav}  ({audio_secs:.2}s, {} Hz src)",
+        spec.sample_rate
+    );
     println!("threads:      {n_threads}");
     println!("runs:         {runs}");
     println!("model load:   {load_ms:.0} ms (one-time)");
-    println!("transcribe:   min {min:.0} ms | median {median:.0} ms | max {max:.0} ms (whole clip)");
+    println!(
+        "transcribe:   min {min:.0} ms | median {median:.0} ms | max {max:.0} ms (whole clip)"
+    );
     println!("realtime fac: {rtf:.2}x  (>1 = faster than real time = can keep up live)");
     println!("transcript:   {text}");
     println!(

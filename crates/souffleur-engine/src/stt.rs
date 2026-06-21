@@ -47,11 +47,8 @@ impl Stt {
         // Route whisper.cpp/GGML's chatty C-level logging into the `log` facade.
         // With no log backend feature enabled this silences it (idempotent).
         whisper_rs::install_logging_hooks();
-        let ctx = WhisperContext::new_with_params(
-            model_path,
-            WhisperContextParameters::default(),
-        )
-        .with_context(|| format!("loading whisper model {model_path}"))?;
+        let ctx = WhisperContext::new_with_params(model_path, WhisperContextParameters::default())
+            .with_context(|| format!("loading whisper model {model_path}"))?;
         let model_label = std::path::Path::new(model_path)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -95,8 +92,14 @@ impl Stt {
                 .context("full_get_segment_text")?;
             let trimmed = seg.trim();
             // whisper timestamps are in centiseconds (10 ms units).
-            let t0 = state.full_get_segment_t0(i).context("full_get_segment_t0")? * 10;
-            let t1 = state.full_get_segment_t1(i).context("full_get_segment_t1")? * 10;
+            let t0 = state
+                .full_get_segment_t0(i)
+                .context("full_get_segment_t0")?
+                * 10;
+            let t1 = state
+                .full_get_segment_t1(i)
+                .context("full_get_segment_t1")?
+                * 10;
             if !text.is_empty() {
                 text.push(' ');
             }

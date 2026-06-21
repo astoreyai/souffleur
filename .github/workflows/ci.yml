@@ -1,0 +1,65 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  gate:
+    name: fmt + clippy + test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Native deps: whisper-rs builds whisper.cpp (cmake + a C/C++ compiler) and
+      # generates bindings (libclang); cpal links ALSA on Linux (libasound2-dev).
+      # No model or audio asset is needed — the test suite is offline and
+      # device-free (the model/wav are gitignored and only used at runtime).
+      - name: Install native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake clang libclang-dev pkg-config libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace --locked
+
+  msrv:
+    name: msrv check (1.80)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake clang libclang-dev pkg-config libasound2-dev
+      # Verifies the rust-version declared in Cargo.toml actually builds. If a
+      # dependency raises the floor above 1.80, this job is where it shows up;
+      # bump workspace.package.rust-version to match.
+      - uses: dtolnay/rust-toolchain@1.80.0
+      - uses: Swatinem/rust-cache@v2
+      - name: check
+        run: cargo check --workspace --locked

@@ -91,7 +91,9 @@ fn parse_args() -> Result<Option<Config>> {
     let mut allow_cloud = false;
     let mut wait_surface = false;
     let mut listen_lan = false;
-    let mut token: Option<String> = std::env::var("SOUFFLEUR_TOKEN").ok().filter(|s| !s.is_empty());
+    let mut token: Option<String> = std::env::var("SOUFFLEUR_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty());
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -197,13 +199,21 @@ fn build_channels(cfg: &Config) -> Result<Vec<Channel>> {
             let (rx, alive) = source::spawn_mic()?;
             vec![(Speaker::Me, rx, Some(alive))]
         }
-        Mode::Monitor => vec![(Speaker::Them, source::spawn_monitor(cfg.monitor.clone())?, None)],
+        Mode::Monitor => vec![(
+            Speaker::Them,
+            source::spawn_monitor(cfg.monitor.clone())?,
+            None,
+        )],
         Mode::Wav(p) => vec![(Speaker::Them, source::spawn_wav(p, 100)?, None)],
         Mode::Duplex => {
             let (mrx, alive) = source::spawn_mic()?;
             vec![
                 (Speaker::Me, mrx, Some(alive)),
-                (Speaker::Them, source::spawn_monitor(cfg.monitor.clone())?, None),
+                (
+                    Speaker::Them,
+                    source::spawn_monitor(cfg.monitor.clone())?,
+                    None,
+                ),
             ]
         }
     })
@@ -352,7 +362,10 @@ async fn handle_client(
     shared: Arc<Shared>,
     token: Option<Arc<String>>,
 ) {
-    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
     let ws = if let Some(expected) = token.clone() {
         let cb = move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
             let ok = req
@@ -415,7 +428,9 @@ async fn handle_client(
                             eprintln!("[ws] {peer} set consent disclosed={disclosed}");
                         }
                         Control::Hint { text } => eprintln!("[ws] {peer} hint: {text}"),
-                        Control::Dismiss { prompt_id } => eprintln!("[ws] {peer} dismiss {prompt_id}"),
+                        Control::Dismiss { prompt_id } => {
+                            eprintln!("[ws] {peer} dismiss {prompt_id}")
+                        }
                         Control::Ack => {}
                     }
                 }
@@ -425,7 +440,10 @@ async fn handle_client(
         }
     }
     forward.abort();
-    let count = shared.surfaces.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+    let count = shared
+        .surfaces
+        .fetch_sub(1, Ordering::Relaxed)
+        .saturating_sub(1);
     eprintln!("[ws] surface disconnected: {peer} (surfaces={count})");
 }
 
@@ -466,7 +484,9 @@ async fn main() -> Result<()> {
                 match engine.check() {
                     Ok(()) => {
                         match engine.warmup() {
-                            Ok(ms) => eprintln!("[suggest] backend {bname} ready (warm in {ms} ms)"),
+                            Ok(ms) => {
+                                eprintln!("[suggest] backend {bname} ready (warm in {ms} ms)")
+                            }
                             Err(e) => eprintln!("[suggest] backend {bname} ready (warmup: {e:#})"),
                         }
                         if is_cloud {
@@ -478,7 +498,9 @@ async fn main() -> Result<()> {
                         suggest_handle = Some(
                             std::thread::Builder::new()
                                 .name("souffleur-suggest".into())
-                                .spawn(move || suggestion_worker(engine, sug_rx, tx, t0, print, shared))
+                                .spawn(move || {
+                                    suggestion_worker(engine, sug_rx, tx, t0, print, shared)
+                                })
                                 .context("spawn suggestion worker")?,
                         );
                     }
@@ -505,7 +527,12 @@ async fn main() -> Result<()> {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
-                        tokio::spawn(handle_client(stream, tx.clone(), shared.clone(), token.clone()));
+                        tokio::spawn(handle_client(
+                            stream,
+                            tx.clone(),
+                            shared.clone(),
+                            token.clone(),
+                        ));
                     }
                     Err(e) => {
                         eprintln!("[ws] accept error: {e}");
@@ -523,12 +550,17 @@ async fn main() -> Result<()> {
         while shared.surfaces.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        eprintln!("[core] {} surface(s) connected; starting capture", shared.surfaces.load(Ordering::Relaxed));
+        eprintln!(
+            "[core] {} surface(s) connected; starting capture",
+            shared.surfaces.load(Ordering::Relaxed)
+        );
     }
 
     // Capture + streaming threads, one per channel.
     let channels = build_channels(&cfg)?;
-    shared.active_channels.store(channels.len(), Ordering::Relaxed);
+    shared
+        .active_channels
+        .store(channels.len(), Ordering::Relaxed);
     shared.capturing.store(true, Ordering::Relaxed);
     let mut handles = Vec::new();
     let mut alive_flags: Vec<Arc<AtomicBool>> = Vec::new();

@@ -124,7 +124,9 @@ pub fn spawn_wav(path: &str, chunk_ms: u64) -> Result<Receiver<Vec<f32>>> {
     let mut reader = hound::WavReader::open(path).with_context(|| format!("open wav {path}"))?;
     let spec = reader.spec();
     let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader.samples::<f32>().collect::<std::result::Result<_, _>>()?,
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<std::result::Result<_, _>>()?,
         hound::SampleFormat::Int => {
             let max = ((1i64 << (spec.bits_per_sample - 1)) - 1) as f32;
             reader

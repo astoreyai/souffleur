@@ -32,7 +32,14 @@ pub fn list_input_devices() -> Result<Vec<String>> {
         let name = dev.name().unwrap_or_else(|_| "<unknown>".into());
         let cfg = dev
             .default_input_config()
-            .map(|c| format!("{} Hz, {} ch, {:?}", c.sample_rate().0, c.channels(), c.sample_format()))
+            .map(|c| {
+                format!(
+                    "{} Hz, {} ch, {:?}",
+                    c.sample_rate().0,
+                    c.channels(),
+                    c.sample_format()
+                )
+            })
             .unwrap_or_else(|_| "<no default config>".into());
         let marker = if name == default { " (default)" } else { "" };
         out.push(format!("{name}{marker}  [{cfg}]"));
@@ -47,7 +54,10 @@ pub fn list_input_devices() -> Result<Vec<String>> {
 /// and is kept alive until the process exits (cpal streams are not `Send` on all
 /// hosts, so we never move it across threads). Returns the device's real sample
 /// rate / channel count.
-pub fn spawn_default_mic_capture(tx: Sender<Vec<f32>>, alive: Arc<AtomicBool>) -> Result<CaptureInfo> {
+pub fn spawn_default_mic_capture(
+    tx: Sender<Vec<f32>>,
+    alive: Arc<AtomicBool>,
+) -> Result<CaptureInfo> {
     let (init_tx, init_rx) = crossbeam_channel::bounded::<Result<CaptureInfo>>(1);
 
     std::thread::Builder::new()
@@ -76,7 +86,10 @@ pub fn spawn_default_mic_capture(tx: Sender<Vec<f32>>, alive: Arc<AtomicBool>) -
         .context("capture thread init channel closed")?
 }
 
-fn build_and_play(tx: Sender<Vec<f32>>, alive: Arc<AtomicBool>) -> Result<(CaptureInfo, cpal::Stream)> {
+fn build_and_play(
+    tx: Sender<Vec<f32>>,
+    alive: Arc<AtomicBool>,
+) -> Result<(CaptureInfo, cpal::Stream)> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -118,7 +131,10 @@ fn build_and_play(tx: Sender<Vec<f32>>, alive: Arc<AtomicBool>) -> Result<(Captu
         cpal::SampleFormat::U16 => device.build_input_stream(
             &config,
             move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                let f: Vec<f32> = data.iter().map(|&s| (s as f32 - 32768.0) / 32768.0).collect();
+                let f: Vec<f32> = data
+                    .iter()
+                    .map(|&s| (s as f32 - 32768.0) / 32768.0)
+                    .collect();
                 tx.try_send(downmix_mono(&f, channels)).ok();
             },
             err_fn,

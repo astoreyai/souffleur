@@ -215,7 +215,44 @@ mod tests {
 
     #[test]
     fn control_parses() {
-        let c: Control = serde_json::from_str(r#"{"type":"set_consent","disclosed":true}"#).unwrap();
-        matches!(c, Control::SetConsent { disclosed: true });
+        let c: Control =
+            serde_json::from_str(r#"{"type":"set_consent","disclosed":true}"#).unwrap();
+        assert!(matches!(c, Control::SetConsent { disclosed: true }));
+
+        let d: Control = serde_json::from_str(r#"{"type":"dismiss","prompt_id":"p7"}"#).unwrap();
+        assert!(matches!(d, Control::Dismiss { prompt_id } if prompt_id == "p7"));
+
+        let h: Control = serde_json::from_str(r#"{"type":"hint","text":"slow down"}"#).unwrap();
+        assert!(matches!(h, Control::Hint { text } if text == "slow down"));
+
+        let a: Control = serde_json::from_str(r#"{"type":"ack"}"#).unwrap();
+        assert!(matches!(a, Control::Ack));
+    }
+
+    #[test]
+    fn speaker_them_n_roundtrips() {
+        // wire string <-> ThemN, in both serde directions
+        assert_eq!("them:3".parse::<Speaker>().unwrap(), Speaker::ThemN(3));
+        assert_eq!(Speaker::ThemN(3).to_string(), "them:3");
+
+        let json = serde_json::to_string(&Speaker::ThemN(2)).unwrap();
+        assert_eq!(json, "\"them:2\"");
+        let back: Speaker = serde_json::from_str("\"them:2\"").unwrap();
+        assert_eq!(back, Speaker::ThemN(2));
+
+        // me / them still roundtrip
+        assert_eq!(
+            serde_json::from_str::<Speaker>("\"me\"").unwrap(),
+            Speaker::Me
+        );
+        assert_eq!(
+            serde_json::from_str::<Speaker>("\"them\"").unwrap(),
+            Speaker::Them
+        );
+
+        // garbage rejected, not silently coerced
+        assert!("them:".parse::<Speaker>().is_err());
+        assert!("them:notanumber".parse::<Speaker>().is_err());
+        assert!("nobody".parse::<Speaker>().is_err());
     }
 }
