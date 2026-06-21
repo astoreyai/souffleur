@@ -1,16 +1,10 @@
 name: ci
 
-# GitHub-hosted Actions require the account's billing to be in good standing.
-# A failed payment / spending-limit block currently prevents ALL runs — this is
-# account-level and is NOT bypassed by making the repo public. Until it is
-# resolved (Settings > Billing & plans), run the identical gate locally with
-# ./scripts/ci.sh. To re-enable automatic CI, restore the push/pull_request
-# triggers below (delete workflow_dispatch or leave it).
 on:
+  push:
+    branches: [main, master]
+  pull_request:
   workflow_dispatch:
-  # push:
-  #   branches: [main, master]
-  # pull_request:
 
 # Cancel superseded runs on the same ref.
 concurrency:

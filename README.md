@@ -44,9 +44,7 @@ locally with `scripts/ci.sh`:
 git config core.hooksPath .githooks      # optional: run it automatically on every push
 ```
 
-A GitHub Actions workflow (`.github/workflows/ci.yml`) runs the same gate, but is parked on
-`workflow_dispatch` (manual) because GitHub-hosted Actions are disabled on this account until
-its billing is in good standing. Re-enable the `push`/`pull_request` triggers there once it is.
+A GitHub Actions workflow (`.github/workflows/ci.yml`) runs the same gate on every push and PR.
 
 ### Run the core
 
