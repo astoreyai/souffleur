@@ -1,0 +1,2 @@
+frame-sdk>=1.2.4
+websockets>=12.0

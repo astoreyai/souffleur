@@ -1,0 +1,23 @@
+{
+  "name": "souffleur-glasses-mentraos",
+  "version": "0.0.0",
+  "description": "Souffleur MentraOS glasses surface: bridges the Coach Protocol to the lens",
+  "license": "AGPL-3.0-only",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "tsc && node --test dist/bridge.test.js",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@mentra/sdk": "^2.1.29",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "@types/ws": "^8.18.1",
+    "typescript": "^6.0.3"
+  }
+}
