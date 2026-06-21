@@ -82,15 +82,41 @@ fn parse_kind(s: &Option<String>) -> PromptKind {
     }
 }
 
-/// Pull the first balanced JSON object out of a string (in case the model wraps it).
+/// Pull the FIRST balanced JSON object out of a string (models sometimes wrap
+/// the JSON in prose or emit trailing junk after it). Walks brace depth,
+/// respecting string literals and escapes, so a `}` inside a string value or a
+/// stray brace in trailing prose does not corrupt the result.
 fn extract_json_object(s: &str) -> Option<&str> {
-    let start = s.find('{')?;
-    let end = s.rfind('}')?;
-    if end > start {
-        Some(&s[start..=end])
-    } else {
-        None
+    let bytes = s.as_bytes();
+    let start = s.find('{')?; // '{' is ASCII, so this is a char boundary
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    for i in start..bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&s[start..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
+    None
 }
 
 impl SuggestionEngine {
@@ -225,6 +251,24 @@ mod tests {
     fn extracts_wrapped_json() {
         let s = "thinking... {\"prompts\":[]} trailing";
         assert_eq!(extract_json_object(s), Some("{\"prompts\":[]}"));
+    }
+
+    #[test]
+    fn extracts_balanced_object_ignoring_trailing_braces() {
+        // first-brace-to-last-brace (the old impl) would wrongly grab the {x}.
+        let s = "{\"prompts\":[{\"text\":\"hi\"}]} note: {x}";
+        assert_eq!(extract_json_object(s), Some("{\"prompts\":[{\"text\":\"hi\"}]}"));
+    }
+
+    #[test]
+    fn brace_inside_string_does_not_close_object() {
+        let s = "{\"text\":\"close } brace\"} tail";
+        assert_eq!(extract_json_object(s), Some("{\"text\":\"close } brace\"}"));
+    }
+
+    #[test]
+    fn no_object_returns_none() {
+        assert_eq!(extract_json_object("no json here"), None);
     }
 
     #[test]

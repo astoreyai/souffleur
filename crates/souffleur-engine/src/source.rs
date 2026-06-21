@@ -84,17 +84,25 @@ pub fn spawn_monitor(monitor: Option<String>) -> Result<Receiver<Vec<f32>>> {
     std::thread::Builder::new()
         .name("souffleur-src-monitor".into())
         .spawn(move || {
-            // ~100 ms of audio per read at 16 kHz mono f32 = 1600 samples = 6400 bytes.
-            let mut raw = [0u8; 6400];
+            // A pipe read can return any byte count, so f32 frames straddle reads.
+            // Carry the 0-3 leftover bytes across reads instead of discarding them
+            // (discarding desyncs every subsequent sample for the rest of the session).
+            let mut raw = [0u8; 8192];
+            let mut carry: Vec<u8> = Vec::new();
             loop {
                 match stdout.read(&mut raw) {
                     Ok(0) => break, // parec exited
                     Ok(n) => {
-                        let n = n - (n % 4); // whole f32 samples only
-                        let mut samples = Vec::with_capacity(n / 4);
-                        for b in raw[..n].chunks_exact(4) {
+                        carry.extend_from_slice(&raw[..n]);
+                        let whole = carry.len() - (carry.len() % 4);
+                        if whole == 0 {
+                            continue;
+                        }
+                        let mut samples = Vec::with_capacity(whole / 4);
+                        for b in carry[..whole].chunks_exact(4) {
                             samples.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
                         }
+                        carry.drain(..whole); // keep the trailing partial frame
                         if tx.send(samples).is_err() {
                             break;
                         }
