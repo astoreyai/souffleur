@@ -1,20 +1,26 @@
-//! Local coaching-suggestion engine.
+//! Local + cloud coaching-suggestion engine.
 //!
-//! Given the recent confirmed transcript, asks a local LLM (Ollama) for up to a
-//! couple of short coaching cues and turns them into Coach Protocol `prompt`
-//! events. Local-only by default — the transcript never leaves the machine. If
-//! Ollama is unavailable the engine reports it; the daemon then runs transcript-
-//! only rather than fabricating prompts (no stubs).
+//! Given the recent confirmed transcript, a [`SuggestBackend`] returns up to a
+//! couple of short coaching cues as JSON, which the engine turns into Coach
+//! Protocol `prompt` events.
+//!
+//! - **Local (default):** Ollama on the machine — the transcript never leaves it.
+//! - **Cloud (opt-in, BYO-key, consent-gated):** Gemini / Claude / OpenAI. These
+//!   send the transcript off-device, so the daemon gates them behind
+//!   `--allow-cloud` AND a disclosed-consent flag (see [`SuggestionEngine::suggest_gated`]).
+//!
+//! No mock backend exists (no-stub rule): a cloud backend with no API key fails
+//! closed at construction.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
+use serde_json::{json, Value};
 use souffleur_protocol::{Event, PromptKind, PROTOCOL_VERSION};
 use std::time::{Duration, Instant};
 
+/// Shared tuning, independent of which backend is selected.
 #[derive(Debug, Clone)]
 pub struct SuggestConfig {
-    pub url: String,
-    pub model: String,
     pub max_turns: usize,
     pub temperature: f32,
     pub num_predict: i32,
@@ -24,12 +30,10 @@ pub struct SuggestConfig {
 impl Default for SuggestConfig {
     fn default() -> Self {
         Self {
-            url: "http://localhost:11434".to_string(),
-            model: "qwen3:8b".to_string(),
             max_turns: 8,
             temperature: 0.4,
-            num_predict: 200,
-            timeout: Duration::from_secs(25),
+            num_predict: 256,
+            timeout: Duration::from_secs(20),
         }
     }
 }
@@ -44,20 +48,298 @@ an objection rebuttal, a next-line cue). priority is 1-5 (5=urgent). Suggest onl
 when genuinely useful; return {\"prompts\":[]} when nothing helps. Never invent \
 facts not supported by the transcript.";
 
-pub struct SuggestionEngine {
-    cfg: SuggestConfig,
-    context: Vec<(String, String)>,
-    pid: u32,
+fn user_prompt(transcript: &str) -> String {
+    format!("Transcript so far:\n{transcript}\n\nCoach ME now. Respond with only the JSON object.")
 }
 
-#[derive(Deserialize)]
-struct ChatResp {
-    message: ChatMsg,
+// ----------------------------------------------------------------------------
+// Backend trait + implementations
+// ----------------------------------------------------------------------------
+
+/// A pluggable completion backend. `complete` returns the model's raw JSON text
+/// (a `{"prompts":[...]}` object) plus the round-trip latency in ms.
+pub trait SuggestBackend: Send {
+    fn name(&self) -> &str;
+    /// True if this backend sends the transcript off the machine.
+    fn is_cloud(&self) -> bool;
+    /// Validate the backend is reachable / configured (called once at startup).
+    fn check(&self) -> Result<()>;
+    /// Optional warmup (load the model). Default: no-op.
+    fn warmup(&self) -> Result<u64> {
+        Ok(0)
+    }
+    fn complete(&self, system: &str, transcript: &str, cfg: &SuggestConfig) -> Result<(String, u64)>;
 }
-#[derive(Deserialize)]
-struct ChatMsg {
-    content: String,
+
+/// Local Ollama backend (`/api/chat`, JSON mode). On-device; not cloud.
+pub struct OllamaBackend {
+    url: String,
+    model: String,
 }
+
+impl OllamaBackend {
+    pub fn new(model: impl Into<String>) -> Self {
+        Self {
+            url: std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".into()),
+            model: model.into(),
+        }
+    }
+}
+
+impl SuggestBackend for OllamaBackend {
+    fn name(&self) -> &str {
+        "ollama"
+    }
+    fn is_cloud(&self) -> bool {
+        false
+    }
+    fn check(&self) -> Result<()> {
+        let resp = ureq::get(&format!("{}/api/tags", self.url))
+            .timeout(Duration::from_secs(3))
+            .call()
+            .context("ollama /api/tags (is `ollama serve` running?)")?;
+        let body: Value = resp.into_json().context("parse /api/tags")?;
+        let have = body["models"]
+            .as_array()
+            .map(|a| a.iter().any(|m| m["name"].as_str() == Some(self.model.as_str())))
+            .unwrap_or(false);
+        if !have {
+            bail!("ollama model {:?} not pulled (try `ollama pull {}`)", self.model, self.model);
+        }
+        Ok(())
+    }
+    fn warmup(&self) -> Result<u64> {
+        let req = json!({
+            "model": self.model, "stream": false, "think": false,
+            "options": { "num_predict": 1 },
+            "messages": [{ "role": "user", "content": "ok" }]
+        });
+        let started = Instant::now();
+        ureq::post(&format!("{}/api/chat", self.url))
+            .timeout(Duration::from_secs(20))
+            .send_json(req)
+            .context("ollama warmup")?;
+        Ok(started.elapsed().as_millis() as u64)
+    }
+    fn complete(&self, system: &str, transcript: &str, cfg: &SuggestConfig) -> Result<(String, u64)> {
+        let req = json!({
+            "model": self.model, "stream": false, "think": false, "format": "json",
+            "options": { "temperature": cfg.temperature, "num_predict": cfg.num_predict },
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": user_prompt(transcript) }
+            ]
+        });
+        let started = Instant::now();
+        let resp = ureq::post(&format!("{}/api/chat", self.url))
+            .timeout(cfg.timeout)
+            .send_json(req)
+            .context("ollama /api/chat")?;
+        let v: Value = resp.into_json().context("parse chat response")?;
+        let content = v["message"]["content"].as_str().unwrap_or_default().to_string();
+        Ok((content, started.elapsed().as_millis() as u64))
+    }
+}
+
+/// Google Gemini backend (`generateContent`, responseMimeType=application/json).
+pub struct GeminiBackend {
+    model: String,
+    key: String,
+}
+
+impl GeminiBackend {
+    pub fn from_env(model: impl Into<String>) -> Result<Self> {
+        let key = std::env::var("GEMINI_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| anyhow!("GEMINI_API_KEY not set"))?;
+        Ok(Self { model: model.into(), key })
+    }
+}
+
+impl SuggestBackend for GeminiBackend {
+    fn name(&self) -> &str {
+        "gemini"
+    }
+    fn is_cloud(&self) -> bool {
+        true
+    }
+    fn check(&self) -> Result<()> {
+        ureq::get("https://generativelanguage.googleapis.com/v1beta/models")
+            .set("x-goog-api-key", &self.key)
+            .timeout(Duration::from_secs(5))
+            .call()
+            .context("gemini models list (is GEMINI_API_KEY valid?)")?;
+        Ok(())
+    }
+    fn complete(&self, system: &str, transcript: &str, cfg: &SuggestConfig) -> Result<(String, u64)> {
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+            self.model
+        );
+        let req = json!({
+            "system_instruction": { "parts": [{ "text": system }] },
+            "contents": [{ "role": "user", "parts": [{ "text": user_prompt(transcript) }] }],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "temperature": cfg.temperature,
+                "maxOutputTokens": cfg.num_predict.max(64),
+                // Gemini 2.5 models think by default and would spend the whole
+                // output budget on thoughts; disable it for this short JSON task.
+                "thinkingConfig": { "thinkingBudget": 0 }
+            }
+        });
+        let started = Instant::now();
+        let resp = ureq::post(&url)
+            .set("x-goog-api-key", &self.key)
+            .timeout(cfg.timeout)
+            .send_json(req)
+            .context("gemini generateContent")?;
+        let v: Value = resp.into_json().context("parse gemini response")?;
+        let content = v["candidates"][0]["content"]["parts"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        Ok((content, started.elapsed().as_millis() as u64))
+    }
+}
+
+/// Anthropic Claude backend (`/v1/messages`). BYO-key (`ANTHROPIC_API_KEY`).
+pub struct AnthropicBackend {
+    model: String,
+    key: String,
+}
+
+impl AnthropicBackend {
+    pub fn from_env(model: impl Into<String>) -> Result<Self> {
+        let key = std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| anyhow!("ANTHROPIC_API_KEY not set"))?;
+        Ok(Self { model: model.into(), key })
+    }
+}
+
+impl SuggestBackend for AnthropicBackend {
+    fn name(&self) -> &str {
+        "anthropic"
+    }
+    fn is_cloud(&self) -> bool {
+        true
+    }
+    fn check(&self) -> Result<()> {
+        ureq::get("https://api.anthropic.com/v1/models")
+            .set("x-api-key", &self.key)
+            .set("anthropic-version", "2023-06-01")
+            .timeout(Duration::from_secs(5))
+            .call()
+            .context("anthropic /v1/models (is ANTHROPIC_API_KEY valid?)")?;
+        Ok(())
+    }
+    fn complete(&self, system: &str, transcript: &str, cfg: &SuggestConfig) -> Result<(String, u64)> {
+        let req = json!({
+            "model": self.model,
+            "max_tokens": cfg.num_predict.max(256),
+            "system": system,
+            "messages": [{ "role": "user", "content": user_prompt(transcript) }]
+        });
+        let started = Instant::now();
+        let resp = ureq::post("https://api.anthropic.com/v1/messages")
+            .set("x-api-key", &self.key)
+            .set("anthropic-version", "2023-06-01")
+            .set("content-type", "application/json")
+            .timeout(cfg.timeout)
+            .send_json(req)
+            .context("anthropic /v1/messages")?;
+        let v: Value = resp.into_json().context("parse anthropic response")?;
+        // content is a list of blocks; take the first text block.
+        let content = v["content"]
+            .as_array()
+            .and_then(|blocks| blocks.iter().find_map(|b| b["text"].as_str()))
+            .unwrap_or_default()
+            .to_string();
+        Ok((content, started.elapsed().as_millis() as u64))
+    }
+}
+
+/// OpenAI (or OpenAI-compatible) backend (`/v1/chat/completions`, json_object).
+pub struct OpenAiBackend {
+    model: String,
+    key: String,
+    base: String,
+}
+
+impl OpenAiBackend {
+    pub fn from_env(model: impl Into<String>) -> Result<Self> {
+        let key = std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| anyhow!("OPENAI_API_KEY not set"))?;
+        let base = std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
+        Ok(Self { model: model.into(), key, base })
+    }
+}
+
+impl SuggestBackend for OpenAiBackend {
+    fn name(&self) -> &str {
+        "openai"
+    }
+    fn is_cloud(&self) -> bool {
+        true
+    }
+    fn check(&self) -> Result<()> {
+        ureq::get(&format!("{}/models", self.base))
+            .set("authorization", &format!("Bearer {}", self.key))
+            .timeout(Duration::from_secs(5))
+            .call()
+            .context("openai /models (is OPENAI_API_KEY valid?)")?;
+        Ok(())
+    }
+    fn complete(&self, system: &str, transcript: &str, cfg: &SuggestConfig) -> Result<(String, u64)> {
+        let req = json!({
+            "model": self.model,
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": user_prompt(transcript) }
+            ],
+            "response_format": { "type": "json_object" },
+            "temperature": cfg.temperature,
+            "max_tokens": cfg.num_predict.max(256)
+        });
+        let started = Instant::now();
+        let resp = ureq::post(&format!("{}/chat/completions", self.base))
+            .set("authorization", &format!("Bearer {}", self.key))
+            .timeout(cfg.timeout)
+            .send_json(req)
+            .context("openai /chat/completions")?;
+        let v: Value = resp.into_json().context("parse openai response")?;
+        let content = v["choices"][0]["message"]["content"].as_str().unwrap_or_default().to_string();
+        Ok((content, started.elapsed().as_millis() as u64))
+    }
+}
+
+/// Construct a backend by name. Cloud backends read their key from the
+/// environment and fail closed if it's missing. `model` overrides the per-backend
+/// default.
+pub fn make_backend(kind: &str, model: Option<String>) -> Result<Box<dyn SuggestBackend>> {
+    Ok(match kind {
+        "local" | "ollama" => Box::new(OllamaBackend::new(model.unwrap_or_else(|| "qwen3:8b".into()))),
+        "gemini" => Box::new(GeminiBackend::from_env(model.unwrap_or_else(|| "gemini-2.5-flash".into()))?),
+        "claude" | "anthropic" => Box::new(AnthropicBackend::from_env(model.unwrap_or_else(|| "claude-opus-4-8".into()))?),
+        "openai" => Box::new(OpenAiBackend::from_env(model.unwrap_or_else(|| "gpt-4o-mini".into()))?),
+        other => bail!("unknown suggest backend: {other} (local|gemini|claude|openai)"),
+    })
+}
+
+/// True if a backend name sends data off-device (so it needs --allow-cloud).
+pub fn backend_is_cloud(kind: &str) -> bool {
+    !matches!(kind, "local" | "ollama")
+}
+
+// ----------------------------------------------------------------------------
+// Engine
+// ----------------------------------------------------------------------------
+
 #[derive(Deserialize)]
 struct PromptList {
     #[serde(default)]
@@ -119,55 +401,62 @@ fn extract_json_object(s: &str) -> Option<&str> {
     None
 }
 
-impl SuggestionEngine {
-    pub fn new(cfg: SuggestConfig) -> Self {
-        Self {
-            cfg,
-            context: Vec::new(),
-            pid: 0,
-        }
-    }
+/// Parse model JSON output into `prompt` events, allocating ids from `pid`.
+fn parse_prompts(content: &str, pid: &mut u32, session_ms: u64) -> Result<Vec<Event>> {
+    let list = serde_json::from_str::<PromptList>(content)
+        .or_else(|_| {
+            extract_json_object(content)
+                .ok_or_else(|| anyhow!("no JSON object in model output"))
+                .and_then(|j| serde_json::from_str::<PromptList>(j).map_err(|e| e.into()))
+        })
+        .with_context(|| format!("parse prompts from: {content:?}"))?;
 
-    /// Is the Ollama server reachable and the model present?
-    pub fn check(&self) -> Result<()> {
-        let resp = ureq::get(&format!("{}/api/tags", self.cfg.url))
-            .timeout(Duration::from_secs(3))
-            .call()
-            .context("ollama /api/tags (is `ollama serve` running?)")?;
-        let body: serde_json::Value = resp.into_json().context("parse /api/tags")?;
-        let have = body["models"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .any(|m| m["name"].as_str() == Some(self.cfg.model.as_str()))
-            })
-            .unwrap_or(false);
-        if !have {
-            return Err(anyhow!(
-                "ollama model {:?} not pulled (try `ollama pull {}`)",
-                self.cfg.model,
-                self.cfg.model
-            ));
+    let mut out = Vec::new();
+    for item in list.prompts {
+        let text = item.text.trim().to_string();
+        if text.is_empty() {
+            continue;
         }
-        Ok(())
-    }
-
-    /// Load the model into the server (and GPU) so the first real suggestion
-    /// isn't a cold hit. Returns the warmup round-trip in ms.
-    pub fn warmup(&self) -> Result<u64> {
-        let req = serde_json::json!({
-            "model": self.cfg.model,
-            "stream": false,
-            "think": false,
-            "options": { "num_predict": 1 },
-            "messages": [{ "role": "user", "content": "ok" }]
+        *pid += 1;
+        out.push(Event::Prompt {
+            version: PROTOCOL_VERSION,
+            t: session_ms,
+            prompt_id: format!("p{pid}"),
+            kind: parse_kind(&item.kind),
+            text,
+            ttl_ms: 12_000,
+            priority: item.priority.unwrap_or(3).clamp(1, 5),
+            source_utterance: None,
         });
-        let started = Instant::now();
-        ureq::post(&format!("{}/api/chat", self.cfg.url))
-            .timeout(self.cfg.timeout)
-            .send_json(req)
-            .context("ollama warmup")?;
-        Ok(started.elapsed().as_millis() as u64)
+    }
+    Ok(out)
+}
+
+/// Wraps a backend with rolling transcript context and a single prompt-id counter
+/// (so ids never collide regardless of backend).
+pub struct SuggestionEngine {
+    backend: Box<dyn SuggestBackend>,
+    cfg: SuggestConfig,
+    context: Vec<(String, String)>,
+    pid: u32,
+}
+
+impl SuggestionEngine {
+    pub fn new(backend: Box<dyn SuggestBackend>, cfg: SuggestConfig) -> Self {
+        Self { backend, cfg, context: Vec::new(), pid: 0 }
+    }
+
+    pub fn backend_name(&self) -> &str {
+        self.backend.name()
+    }
+    pub fn is_cloud(&self) -> bool {
+        self.backend.is_cloud()
+    }
+    pub fn check(&self) -> Result<()> {
+        self.backend.check()
+    }
+    pub fn warmup(&self) -> Result<u64> {
+        self.backend.warmup()
     }
 
     pub fn push_turn(&mut self, speaker: &str, text: &str) {
@@ -186,60 +475,24 @@ impl SuggestionEngine {
             .join("\n")
     }
 
-    /// Call the LLM on the current context and return any `prompt` events.
-    /// Returns the LLM round-trip latency alongside the events.
+    /// Run the backend on the current context and return any `prompt` events.
     pub fn suggest(&mut self, session_ms: u64) -> Result<(Vec<Event>, u64)> {
         if self.context.is_empty() {
             return Ok((Vec::new(), 0));
         }
-        let req = serde_json::json!({
-            "model": self.cfg.model,
-            "stream": false,
-            "think": false,
-            "format": "json",
-            "options": { "temperature": self.cfg.temperature, "num_predict": self.cfg.num_predict },
-            "messages": [
-                { "role": "system", "content": SYSTEM_PROMPT },
-                { "role": "user", "content": format!("Transcript so far:\n{}\n\nCoach ME now.", self.transcript()) }
-            ]
-        });
+        let (content, latency) = self.backend.complete(SYSTEM_PROMPT, &self.transcript(), &self.cfg)?;
+        let evs = parse_prompts(&content, &mut self.pid, session_ms)?;
+        Ok((evs, latency))
+    }
 
-        let started = Instant::now();
-        let resp = ureq::post(&format!("{}/api/chat", self.cfg.url))
-            .timeout(self.cfg.timeout)
-            .send_json(req)
-            .context("ollama /api/chat")?;
-        let parsed: ChatResp = resp.into_json().context("parse chat response")?;
-        let latency = started.elapsed().as_millis() as u64;
-
-        let content = parsed.message.content;
-        let json = serde_json::from_str::<PromptList>(&content)
-            .or_else(|_| {
-                extract_json_object(&content)
-                    .ok_or_else(|| anyhow!("no JSON object in model output"))
-                    .and_then(|j| serde_json::from_str::<PromptList>(j).map_err(|e| e.into()))
-            })
-            .with_context(|| format!("parse prompts from: {content:?}"))?;
-
-        let mut out = Vec::new();
-        for item in json.prompts {
-            let text = item.text.trim().to_string();
-            if text.is_empty() {
-                continue;
-            }
-            self.pid += 1;
-            out.push(Event::Prompt {
-                version: PROTOCOL_VERSION,
-                t: session_ms,
-                prompt_id: format!("p{}", self.pid),
-                kind: parse_kind(&item.kind),
-                text,
-                ttl_ms: 12_000,
-                priority: item.priority.unwrap_or(3).clamp(1, 5),
-                source_utterance: None,
-            });
+    /// Like [`suggest`](Self::suggest), but a CLOUD backend refuses to transmit
+    /// the transcript off-device unless consent has been disclosed. This is the
+    /// enforced privacy chokepoint for the cloud tier.
+    pub fn suggest_gated(&mut self, session_ms: u64, consent_disclosed: bool) -> Result<(Vec<Event>, u64)> {
+        if self.is_cloud() && !consent_disclosed {
+            return Ok((Vec::new(), 0));
         }
-        Ok((out, latency))
+        self.suggest(session_ms)
     }
 }
 
@@ -255,7 +508,6 @@ mod tests {
 
     #[test]
     fn extracts_balanced_object_ignoring_trailing_braces() {
-        // first-brace-to-last-brace (the old impl) would wrongly grab the {x}.
         let s = "{\"prompts\":[{\"text\":\"hi\"}]} note: {x}";
         assert_eq!(extract_json_object(s), Some("{\"prompts\":[{\"text\":\"hi\"}]}"));
     }
@@ -273,19 +525,56 @@ mod tests {
 
     #[test]
     fn kind_mapping() {
-        assert!(matches!(
-            parse_kind(&Some("OBJECTION".into())),
-            PromptKind::Objection
-        ));
+        assert!(matches!(parse_kind(&Some("OBJECTION".into())), PromptKind::Objection));
         assert!(matches!(parse_kind(&None), PromptKind::Note));
     }
 
     #[test]
+    fn parse_prompts_allocates_ids_and_clamps_priority() {
+        let mut pid = 0;
+        let evs = parse_prompts(
+            "{\"prompts\":[{\"kind\":\"cue\",\"text\":\"go\",\"priority\":9},{\"text\":\"\"}]}",
+            &mut pid,
+            5,
+        )
+        .unwrap();
+        assert_eq!(evs.len(), 1); // empty-text prompt dropped
+        match &evs[0] {
+            Event::Prompt { prompt_id, priority, .. } => {
+                assert_eq!(prompt_id, "p1");
+                assert_eq!(*priority, 5); // clamped from 9
+            }
+            _ => panic!("wrong event"),
+        }
+    }
+
+    /// A backend that panics if `complete` is called — proves the consent gate
+    /// stops a cloud call before any transcript leaves the machine.
+    struct PanicCloud;
+    impl SuggestBackend for PanicCloud {
+        fn name(&self) -> &str { "panic-cloud" }
+        fn is_cloud(&self) -> bool { true }
+        fn check(&self) -> Result<()> { Ok(()) }
+        fn complete(&self, _: &str, _: &str, _: &SuggestConfig) -> Result<(String, u64)> {
+            panic!("cloud backend must not be called without consent");
+        }
+    }
+
+    #[test]
+    fn cloud_backend_refuses_to_transmit_without_consent() {
+        let mut e = SuggestionEngine::new(Box::new(PanicCloud), SuggestConfig::default());
+        e.push_turn("them", "our budget is tight");
+        let (evs, lat) = e.suggest_gated(1, false).unwrap(); // must NOT call complete()
+        assert!(evs.is_empty());
+        assert_eq!(lat, 0);
+    }
+
+    #[test]
     fn context_truncates() {
-        let mut e = SuggestionEngine::new(SuggestConfig {
-            max_turns: 2,
-            ..Default::default()
-        });
+        let mut e = SuggestionEngine::new(
+            Box::new(OllamaBackend::new("m")),
+            SuggestConfig { max_turns: 2, ..Default::default() },
+        );
         e.push_turn("me", "a");
         e.push_turn("them", "b");
         e.push_turn("me", "c");

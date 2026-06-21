@@ -17,7 +17,7 @@ use futures_util::{SinkExt, StreamExt};
 use souffleur_engine::source;
 use souffleur_engine::stream::{StreamConfig, StreamingStt};
 use souffleur_engine::stt::Stt;
-use souffleur_engine::suggest::{SuggestConfig, SuggestionEngine};
+use souffleur_engine::suggest::{backend_is_cloud, make_backend, SuggestConfig, SuggestionEngine};
 use souffleur_protocol::{Control, Event, Speaker, PROTOCOL_VERSION};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -47,7 +47,8 @@ struct Config {
     print_stdout: bool,
     once: bool,
     no_suggest: bool,
-    suggest_model: String,
+    suggest_backend: String,
+    suggest_model: Option<String>,
     wait_surface: bool,
     token: Option<String>,
 }
@@ -85,7 +86,9 @@ fn parse_args() -> Result<Option<Config>> {
     let mut print_stdout = false;
     let mut once = false;
     let mut no_suggest = false;
-    let mut suggest_model = "qwen3:8b".to_string();
+    let mut suggest_backend = "local".to_string();
+    let mut suggest_model: Option<String> = None;
+    let mut allow_cloud = false;
     let mut wait_surface = false;
     let mut listen_lan = false;
     let mut token: Option<String> = std::env::var("SOUFFLEUR_TOKEN").ok().filter(|s| !s.is_empty());
@@ -109,7 +112,9 @@ fn parse_args() -> Result<Option<Config>> {
             "--print-stdout" => print_stdout = true,
             "--once" => once = true,
             "--no-suggest" => no_suggest = true,
-            "--suggest-model" => suggest_model = args.next().context("--suggest-model")?,
+            "--suggest-backend" => suggest_backend = args.next().context("--suggest-backend")?,
+            "--suggest-model" => suggest_model = Some(args.next().context("--suggest-model")?),
+            "--allow-cloud" => allow_cloud = true,
             "--wait-surface" => wait_surface = true,
             "--listen-lan" => listen_lan = true,
             "--token" => token = Some(args.next().context("--token")?),
@@ -142,6 +147,16 @@ fn parse_args() -> Result<Option<Config>> {
         }
     }
 
+    // Cloud gate: a cloud suggestion backend sends the transcript off-device.
+    if !no_suggest && backend_is_cloud(&suggest_backend) && !allow_cloud {
+        bail!(
+            "--suggest-backend {suggest_backend} is a CLOUD backend — it sends the live transcript off this machine.\n\
+             Re-run with --allow-cloud to opt in. The transcript leaves the device and may be subject to two-party\n\
+             consent / wiretapping law in your jurisdiction (CIPA/BIPA in 11 US states); coaching stays gated on a\n\
+             disclosed-consent toggle. Local (on-device) is the default; pass nothing for it."
+        );
+    }
+
     Ok(Some(Config {
         mode,
         model,
@@ -152,6 +167,7 @@ fn parse_args() -> Result<Option<Config>> {
         print_stdout,
         once,
         no_suggest,
+        suggest_backend,
         suggest_model,
         wait_surface,
         token,
@@ -254,21 +270,46 @@ fn suggestion_worker(
     tx: broadcast::Sender<String>,
     t0: Instant,
     print: bool,
+    shared: Arc<Shared>,
 ) {
+    let cloud = engine.is_cloud();
     let mut degraded = false;
     let mut fails = 0u32;
+    let mut consent_warned = false;
     while let Ok((sp, txt)) = rx.recv() {
         engine.push_turn(&sp, &txt);
         while let Ok((s2, t2)) = rx.try_recv() {
             engine.push_turn(&s2, &t2);
         }
+
+        let consent = shared.consent_disclosed.load(Ordering::Relaxed);
+        // A cloud backend must not transmit the transcript until consent is disclosed.
+        if cloud && !consent {
+            if !consent_warned {
+                consent_warned = true;
+                emit(
+                    &tx,
+                    print,
+                    &Event::Error {
+                        version: PROTOCOL_VERSION,
+                        t: now_ms(t0),
+                        code: "cloud_consent_required".into(),
+                        message: "cloud coaching is paused until you disclose the assistant (toggle consent)".into(),
+                        fatal: false,
+                    },
+                );
+            }
+            continue;
+        }
+        consent_warned = false;
+
         // If we were degraded, re-check liveness before spending a full timeout.
         if degraded && engine.check().is_ok() {
             degraded = false;
             fails = 0;
             eprintln!("[suggest] recovered");
         }
-        match engine.suggest(now_ms(t0)) {
+        match engine.suggest_gated(now_ms(t0), consent) {
             Ok((evs, lat)) => {
                 if degraded {
                     degraded = false;
@@ -417,24 +458,32 @@ async fn main() -> Result<()> {
     if cfg.no_suggest {
         eprintln!("[suggest] disabled (--no-suggest)");
     } else {
-        let engine = SuggestionEngine::new(SuggestConfig {
-            model: cfg.suggest_model.clone(),
-            ..Default::default()
-        });
-        match engine.check() {
-            Ok(()) => {
-                match engine.warmup() {
-                    Ok(ms) => eprintln!("[suggest] using local model {} (warm in {ms} ms)", cfg.suggest_model),
-                    Err(e) => eprintln!("[suggest] using local model {} (warmup failed: {e:#})", cfg.suggest_model),
+        match make_backend(&cfg.suggest_backend, cfg.suggest_model.clone()) {
+            Ok(backend) => {
+                let engine = SuggestionEngine::new(backend, SuggestConfig::default());
+                let bname = engine.backend_name().to_string();
+                let is_cloud = engine.is_cloud();
+                match engine.check() {
+                    Ok(()) => {
+                        match engine.warmup() {
+                            Ok(ms) => eprintln!("[suggest] backend {bname} ready (warm in {ms} ms)"),
+                            Err(e) => eprintln!("[suggest] backend {bname} ready (warmup: {e:#})"),
+                        }
+                        if is_cloud {
+                            eprintln!("[suggest] CLOUD backend — transcript is sent off-device ONLY after consent is disclosed");
+                        }
+                        let tx = tx.clone();
+                        let print = cfg.print_stdout;
+                        let shared = shared.clone();
+                        suggest_handle = Some(
+                            std::thread::Builder::new()
+                                .name("souffleur-suggest".into())
+                                .spawn(move || suggestion_worker(engine, sug_rx, tx, t0, print, shared))
+                                .context("spawn suggestion worker")?,
+                        );
+                    }
+                    Err(e) => eprintln!("[suggest] disabled: {e:#}  (transcript-only)"),
                 }
-                let tx = tx.clone();
-                let print = cfg.print_stdout;
-                suggest_handle = Some(
-                    std::thread::Builder::new()
-                        .name("souffleur-suggest".into())
-                        .spawn(move || suggestion_worker(engine, sug_rx, tx, t0, print))
-                        .context("spawn suggestion worker")?,
-                );
             }
             Err(e) => eprintln!("[suggest] disabled: {e:#}  (transcript-only)"),
         }
