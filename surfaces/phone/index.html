@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#0b0d12" />
+<link rel="manifest" href="manifest.json" />
+<title>Souffleur</title>
+<style>
+  :root {
+    --bg: #0b0d12; --panel: #141822; --panel2: #1b2130; --line: #232b3a;
+    --me: #6ea8fe; --them: #b9c4d6; --muted: #6b7589; --text: #e8edf6;
+    --fact:#3fb950; --question:#58a6ff; --objection:#f0883e; --cue:#bc8cff; --recover:#f85149; --note:#8b949e;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  body { display: flex; flex-direction: column; max-width: 520px; margin: 0 auto;
+    padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+
+  header { display: flex; align-items: center; gap: 10px; padding: 14px 16px;
+    border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; }
+  .logo { font-weight: 700; letter-spacing: .3px; }
+  .logo small { color: var(--muted); font-weight: 400; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #4b5566; transition: background .3s; }
+  .dot.on { background: var(--fact); box-shadow: 0 0 8px var(--fact); }
+  .status { margin-left: auto; color: var(--muted); font-size: 12.5px; text-align: right; }
+
+  /* Prompts: the prominent part */
+  #prompts { padding: 12px 12px 4px; display: flex; flex-direction: column; gap: 8px; }
+  .prompt { background: var(--panel2); border: 1px solid var(--line); border-left: 4px solid var(--note);
+    border-radius: 12px; padding: 11px 13px; animation: pop .18s ease-out; }
+  .prompt .k { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin-bottom: 3px; }
+  .prompt .t { font-size: 18px; font-weight: 600; line-height: 1.3; }
+  .prompt.fact{border-left-color:var(--fact)} .prompt.question{border-left-color:var(--question)}
+  .prompt.objection{border-left-color:var(--objection)} .prompt.cue{border-left-color:var(--cue)}
+  .prompt.recover{border-left-color:var(--recover)} .prompt.note{border-left-color:var(--note)}
+  .prompt.fade { opacity: 0; transform: translateY(-6px); transition: opacity .5s, transform .5s; }
+  @keyframes pop { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  .empty { color: var(--muted); text-align: center; padding: 18px; font-size: 13px; }
+
+  /* Transcript */
+  #transcript { flex: 1; overflow-y: auto; padding: 10px 12px 16px; display: flex; flex-direction: column; gap: 6px; }
+  .line { max-width: 88%; padding: 7px 11px; border-radius: 13px; font-size: 14.5px; word-wrap: break-word; }
+  .them { align-self: flex-start; background: var(--panel); color: var(--them); border-bottom-left-radius: 4px; }
+  .me { align-self: flex-end; background: #1d2b46; color: var(--me); border-bottom-right-radius: 4px; }
+  .who { font-size: 10.5px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); margin-bottom: 1px; }
+  .partial { opacity: .55; font-style: italic; }
+
+  footer { display:flex; align-items:center; gap:10px; padding: 10px 16px; border-top: 1px solid var(--line); background: var(--panel); }
+  .consent { display:flex; align-items:center; gap:8px; font-size: 12.5px; color: var(--muted); }
+  .toggle { width: 38px; height: 22px; border-radius: 22px; background:#2a3344; position:relative; cursor:pointer; transition:background .2s; }
+  .toggle.on { background: var(--fact); }
+  .toggle::after { content:""; position:absolute; top:2px; left:2px; width:18px; height:18px; border-radius:50%; background:#fff; transition:left .2s; }
+  .toggle.on::after { left:18px; }
+</style>
+</head>
+<body>
+  <header>
+    <span class="dot" id="dot"></span>
+    <span class="logo">Souffleur <small id="model"></small></span>
+    <span class="status" id="status">connecting…</span>
+  </header>
+
+  <section id="prompts"><div class="empty" id="prompts-empty">Coaching cues will appear here.</div></section>
+  <div id="transcript"></div>
+
+  <footer>
+    <div class="consent">
+      <span class="toggle" id="consent" title="Announce the assistant to the room"></span>
+      <span id="consent-label">assistant not disclosed</span>
+    </div>
+  </footer>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const params = new URLSearchParams(location.search);
+  // ?ws=... overrides; otherwise default to this host on the Coach Protocol port.
+  const wsUrl = params.get("ws") || `ws://${location.hostname || "127.0.0.1"}:8123`;
+
+  const dot = $("dot"), statusEl = $("status"), modelEl = $("model");
+  const promptsEl = $("prompts"), emptyEl = $("prompts-empty"), transcriptEl = $("transcript");
+  const partials = { me: null, them: null }; // live partial line per speaker
+
+  function setStatus(connected, text) {
+    dot.classList.toggle("on", connected);
+    statusEl.textContent = text;
+  }
+
+  function speakerClass(s) { return String(s).startsWith("me") ? "me" : "them"; }
+
+  function addFinal(speaker, text) {
+    const cls = speakerClass(speaker);
+    if (partials[cls]) { partials[cls].remove(); partials[cls] = null; }
+    const el = document.createElement("div");
+    el.className = `line ${cls}`;
+    el.innerHTML = `<div class="who">${cls === "me" ? "you" : "them"}</div>${escapeHtml(text)}`;
+    transcriptEl.appendChild(el);
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  }
+
+  function showPartial(speaker, text) {
+    const cls = speakerClass(speaker);
+    if (!partials[cls]) {
+      const el = document.createElement("div");
+      el.className = `line ${cls} partial`;
+      el.innerHTML = `<div class="who">${cls === "me" ? "you" : "them"}</div><span class="pt"></span>`;
+      transcriptEl.appendChild(el);
+      partials[cls] = el;
+    }
+    partials[cls].querySelector(".pt").textContent = text;
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  }
+
+  function addPrompt(p) {
+    if (emptyEl) emptyEl.style.display = "none";
+    const kind = (p.kind || "note").toLowerCase();
+    const el = document.createElement("div");
+    el.className = `prompt ${kind}`;
+    el.innerHTML = `<div class="k">${kind} · p${p.priority || 3}</div><div class="t">${escapeHtml(p.text)}</div>`;
+    promptsEl.appendChild(el);
+    while (promptsEl.querySelectorAll(".prompt").length > 4) {
+      promptsEl.querySelector(".prompt").remove();
+    }
+    const ttl = Math.max(3000, p.ttl_ms || 12000);
+    setTimeout(() => { el.classList.add("fade"); setTimeout(() => el.remove(), 500); }, ttl);
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  }
+
+  function handle(ev) {
+    switch (ev.type) {
+      case "transcript.partial": showPartial(ev.speaker, ev.text); break;
+      case "transcript.final": addFinal(ev.speaker, ev.text); break;
+      case "prompt": addPrompt(ev); break;
+      case "state":
+        modelEl.textContent = ev.model ? "· " + ev.model : "";
+        setStatus(true, ev.capturing ? "listening" : "idle");
+        break;
+      case "error": setStatus(true, "error: " + (ev.code || "")); break;
+    }
+  }
+
+  let sock;
+  function connect() {
+    setStatus(false, "connecting…");
+    sock = new WebSocket(wsUrl);
+    sock.onopen = () => setStatus(true, "connected");
+    sock.onclose = () => { setStatus(false, "disconnected — retrying"); setTimeout(connect, 1500); };
+    sock.onerror = () => sock.close();
+    sock.onmessage = (m) => { try { handle(JSON.parse(m.data)); } catch (e) {} };
+  }
+  connect();
+
+  // Consent toggle (sends a control message upstream; surfaces may also just display it).
+  let disclosed = false;
+  $("consent").addEventListener("click", () => {
+    disclosed = !disclosed;
+    $("consent").classList.toggle("on", disclosed);
+    $("consent-label").textContent = disclosed ? "assistant disclosed" : "assistant not disclosed";
+    if (sock && sock.readyState === 1) sock.send(JSON.stringify({ v: 0, type: "set_consent", disclosed }));
+  });
+
+  // Best-effort PWA service worker (ignored if unavailable).
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+})();
+</script>
+</body>
+</html>

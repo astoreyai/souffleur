@@ -1,27 +1,27 @@
-//! `souffleur-core` — the Phase 0 core daemon.
+//! `souffleur-core` — the Souffleur core daemon (Phase 1).
 //!
-//! Captures audio, transcribes it on-device in rolling windows, and emits Coach
-//! Protocol events over a localhost WebSocket for any surface to consume.
+//! Captures audio (mic = me, system-audio monitor = them), transcribes each
+//! channel with overlapping streaming windows, asks a local LLM for short
+//! coaching cues, and publishes Coach Protocol events over a localhost WebSocket
+//! for any surface (phone PWA, glasses, overlay) to consume.
 //!
-//! Sources:
-//!   --source mic               live capture from the default input device (speaker=me)
-//!   --source wav --wav <path>  stream a real WAV in realtime-paced windows (speaker=them)
+//! Modes (--mode):
+//!   mic       live default input only (speaker=me)
+//!   monitor   live system-audio loopback via parec (speaker=them)
+//!   duplex    mic + monitor together (the real both-sides) [default]
+//!   wav       stream a real WAV in realtime (speaker=them; for tests)
 //!
-//! Other flags:
-//!   --list-devices             print input devices and exit
-//!   --model <path>             ggml/gguf model (default models/ggml-base.en.bin)
-//!   --bind <addr>              default 127.0.0.1:8123 (localhost only; transcript is sensitive)
-//!   --window-ms <n>            transcription window (default 3000)
-//!   --threads <n>              whisper threads (default 8)
-//!   --duration-s <n>           mic mode: stop after n seconds
-//!   --print-stdout             also print every emitted frame to stdout
-//!
-//! Windowing here is non-overlapping (chunked). A true overlapping LocalAgreement
-//! sliding window is the Phase 1 refinement; this is real chunked STT, not a stub.
+//! Flags: --model <path> --bind <addr> --threads <n> --wav <path>
+//!        --monitor <src> --duration-s <n> --once --print-stdout
+//!        --no-suggest --suggest-model <name>
 
 use anyhow::{anyhow, Context, Result};
+use crossbeam_channel::Receiver;
 use futures_util::{SinkExt, StreamExt};
-use souffleur_engine::{audio, resample, stt::Stt};
+use souffleur_engine::stream::{StreamConfig, StreamingStt};
+use souffleur_engine::stt::Stt;
+use souffleur_engine::suggest::{SuggestConfig, SuggestionEngine};
+use souffleur_engine::source;
 use souffleur_protocol::{Event, Speaker, PROTOCOL_VERSION};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -31,88 +31,88 @@ use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Clone)]
-enum Source {
+enum Mode {
     Mic,
+    Monitor,
+    Duplex,
     Wav(String),
 }
 
 #[derive(Clone)]
 struct Config {
-    source: Source,
+    mode: Mode,
     model: String,
     bind: String,
-    window_ms: u64,
-    speaker: Speaker,
     threads: i32,
+    monitor: Option<String>,
     duration_s: Option<u64>,
     print_stdout: bool,
     once: bool,
+    no_suggest: bool,
+    suggest_model: String,
+    wait_surface: bool,
 }
 
 fn parse_args() -> Result<Option<Config>> {
-    let mut args = std::env::args().skip(1).peekable();
-    let mut source_kind = "mic".to_string();
+    let mut args = std::env::args().skip(1);
+    let mut mode_kind = "duplex".to_string();
     let mut wav: Option<String> = None;
     let mut model = "models/ggml-base.en.bin".to_string();
     let mut bind = "127.0.0.1:8123".to_string();
-    let mut window_ms = 3000u64;
     let mut threads = 8i32;
+    let mut monitor: Option<String> = None;
     let mut duration_s: Option<u64> = None;
     let mut print_stdout = false;
     let mut once = false;
-    let mut speaker_opt: Option<Speaker> = None;
+    let mut no_suggest = false;
+    let mut suggest_model = "qwen3:8b".to_string();
+    let mut wait_surface = false;
 
     while let Some(a) = args.next() {
         match a.as_str() {
             "--list-devices" => {
                 println!("input devices:");
-                for d in audio::list_input_devices()? {
+                for d in souffleur_engine::audio::list_input_devices()? {
                     println!("  - {d}");
                 }
                 return Ok(None);
             }
-            "--source" => source_kind = args.next().context("--source needs a value")?,
-            "--wav" => wav = Some(args.next().context("--wav needs a path")?),
-            "--model" => model = args.next().context("--model needs a path")?,
-            "--bind" => bind = args.next().context("--bind needs an addr")?,
-            "--window-ms" => window_ms = args.next().context("--window-ms")?.parse()?,
+            "--mode" => mode_kind = args.next().context("--mode")?,
+            "--wav" => wav = Some(args.next().context("--wav")?),
+            "--model" => model = args.next().context("--model")?,
+            "--bind" => bind = args.next().context("--bind")?,
             "--threads" => threads = args.next().context("--threads")?.parse()?,
+            "--monitor" => monitor = Some(args.next().context("--monitor")?),
             "--duration-s" => duration_s = Some(args.next().context("--duration-s")?.parse()?),
-            "--speaker" => {
-                speaker_opt = Some(
-                    args.next()
-                        .context("--speaker")?
-                        .parse()
-                        .map_err(|e| anyhow!("{e}"))?,
-                )
-            }
             "--print-stdout" => print_stdout = true,
             "--once" => once = true,
+            "--no-suggest" => no_suggest = true,
+            "--suggest-model" => suggest_model = args.next().context("--suggest-model")?,
+            "--wait-surface" => wait_surface = true,
             other => return Err(anyhow!("unknown arg: {other}")),
         }
     }
 
-    let source = match source_kind.as_str() {
-        "mic" => Source::Mic,
-        "wav" => Source::Wav(wav.context("--source wav requires --wav <path>")?),
-        other => return Err(anyhow!("unknown --source: {other}")),
+    let mode = match mode_kind.as_str() {
+        "mic" => Mode::Mic,
+        "monitor" => Mode::Monitor,
+        "duplex" => Mode::Duplex,
+        "wav" => Mode::Wav(wav.context("--mode wav requires --wav <path>")?),
+        other => return Err(anyhow!("unknown --mode: {other}")),
     };
-    // Default speaker: mic = me, wav (stand-in for the remote side) = them.
-    let speaker = speaker_opt.unwrap_or(match source {
-        Source::Mic => Speaker::Me,
-        Source::Wav(_) => Speaker::Them,
-    });
 
     Ok(Some(Config {
-        source,
+        mode,
         model,
         bind,
-        window_ms,
-        speaker,
         threads,
+        monitor,
         duration_s,
         print_stdout,
         once,
+        no_suggest,
+        suggest_model,
+        wait_surface,
     }))
 }
 
@@ -125,177 +125,75 @@ fn emit(tx: &broadcast::Sender<String>, print: bool, ev: &Event) {
         if print {
             println!("{line}");
         }
-        let _ = tx.send(line); // Err only means no subscribers; fine.
+        let _ = tx.send(line);
     }
 }
 
-fn state(t0: Instant, model: &str, capturing: bool, surfaces: u32) -> Event {
-    Event::State {
-        version: PROTOCOL_VERSION,
-        t: now_ms(t0),
-        capturing,
-        model: model.to_string(),
-        e2e_latency_ms: None,
-        consent_disclosed: false,
-        surfaces,
-    }
+/// Build the (speaker, audio-stream) channels for the configured mode.
+fn build_channels(cfg: &Config) -> Result<Vec<(Speaker, Receiver<Vec<f32>>)>> {
+    Ok(match &cfg.mode {
+        Mode::Mic => vec![(Speaker::Me, source::spawn_mic()?)],
+        Mode::Monitor => vec![(Speaker::Them, source::spawn_monitor(cfg.monitor.clone())?)],
+        Mode::Wav(p) => vec![(Speaker::Them, source::spawn_wav(p, 100)?)],
+        Mode::Duplex => vec![
+            (Speaker::Me, source::spawn_mic()?),
+            (Speaker::Them, source::spawn_monitor(cfg.monitor.clone())?),
+        ],
+    })
 }
 
-/// Blocking capture+STT loop. Runs on a dedicated std thread (whisper is CPU-blocking).
-fn capture_loop(
-    cfg: Config,
-    stt: Stt,
+/// Per-channel loop: pull audio -> streaming STT -> emit; forward finals to the
+/// suggestion worker. Returns when the source ends (then flushes).
+fn channel_loop(
+    rx: Receiver<Vec<f32>>,
+    mut streamer: StreamingStt,
+    tx: broadcast::Sender<String>,
+    sug_tx: crossbeam_channel::Sender<(String, String)>,
+    t0: Instant,
+    print: bool,
+) {
+    let handle = |ev: &Event, tx: &broadcast::Sender<String>| {
+        if let Event::TranscriptFinal { speaker, text, .. } = ev {
+            let _ = sug_tx.send((speaker.to_string(), text.clone()));
+        }
+        emit(tx, print, ev);
+    };
+    for chunk in rx.iter() {
+        let session_ms = now_ms(t0);
+        for ev in streamer.push(&chunk, session_ms) {
+            handle(&ev, &tx);
+        }
+    }
+    for ev in streamer.flush(now_ms(t0)) {
+        handle(&ev, &tx);
+    }
+    eprintln!("[channel:{}] source ended", streamer.speaker());
+}
+
+/// Suggestion worker: debounce confirmed turns, ask the LLM, emit prompt events.
+fn suggestion_worker(
+    mut engine: SuggestionEngine,
+    rx: crossbeam_channel::Receiver<(String, String)>,
     tx: broadcast::Sender<String>,
     t0: Instant,
-    surfaces: Arc<AtomicUsize>,
-) -> Result<()> {
-    let model_label = stt.model_label().to_string();
-
-    // For the file source, wait (up to 10s) for a surface to connect so it sees
-    // the whole stream from the first window. A live mic never waits.
-    if matches!(cfg.source, Source::Wav(_)) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while surfaces.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
+    print: bool,
+) {
+    while let Ok((sp, txt)) = rx.recv() {
+        engine.push_turn(&sp, &txt);
+        // Coalesce any turns that arrived while we were idle.
+        while let Ok((s2, t2)) = rx.try_recv() {
+            engine.push_turn(&s2, &t2);
         }
-        eprintln!(
-            "[capture] {} surface(s) connected; streaming",
-            surfaces.load(Ordering::Relaxed)
-        );
-    }
-
-    let n = surfaces.load(Ordering::Relaxed) as u32;
-    emit(&tx, cfg.print_stdout, &state(t0, &model_label, true, n));
-
-    match &cfg.source {
-        Source::Wav(path) => stream_wav(path, &cfg, &stt, &tx, t0)?,
-        Source::Mic => stream_mic(&cfg, &stt, &tx, t0)?,
-    }
-
-    let n = surfaces.load(Ordering::Relaxed) as u32;
-    emit(&tx, cfg.print_stdout, &state(t0, &model_label, false, n));
-    eprintln!("[capture] done");
-
-    if cfg.once {
-        // Let the WS forward task flush the final frames, then exit the process
-        // so connected surfaces see a clean socket close.
-        std::thread::sleep(Duration::from_millis(300));
-        std::process::exit(0);
-    }
-    Ok(())
-}
-
-fn stream_wav(
-    path: &str,
-    cfg: &Config,
-    stt: &Stt,
-    tx: &broadcast::Sender<String>,
-    t0: Instant,
-) -> Result<()> {
-    let mut reader = hound::WavReader::open(path).with_context(|| format!("open wav {path}"))?;
-    let spec = reader.spec();
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader.samples::<f32>().collect::<std::result::Result<_, _>>()?,
-        hound::SampleFormat::Int => {
-            let max = ((1i64 << (spec.bits_per_sample - 1)) - 1) as f32;
-            reader
-                .samples::<i32>()
-                .map(|s| s.map(|v| v as f32 / max))
-                .collect::<std::result::Result<_, _>>()?
-        }
-    };
-    let mono = resample::to_mono(&samples, spec.channels as usize);
-    let audio16 = resample::resample_linear(&mono, spec.sample_rate, 16000);
-    let window_samples = (cfg.window_ms as usize * 16000) / 1000;
-
-    eprintln!(
-        "[wav] {path}: {:.2}s audio, {} ms windows -> ~{} chunks",
-        audio16.len() as f64 / 16000.0,
-        cfg.window_ms,
-        audio16.len().div_ceil(window_samples)
-    );
-
-    let mut utt = 0u32;
-    for chunk in audio16.chunks(window_samples) {
-        // Pace to realtime: the window "fills" over its own audio duration.
-        std::thread::sleep(Duration::from_secs_f64(chunk.len() as f64 / 16000.0));
-        let t_capture_end = now_ms(t0);
-        let started = Instant::now();
-        let out = stt.transcribe(chunk)?;
-        let stt_ms = started.elapsed().as_millis() as u64;
-        if souffleur_engine::stt::is_nonspeech(&out.text) {
-            continue;
-        }
-        utt += 1;
-        let ev = Event::TranscriptFinal {
-            version: PROTOCOL_VERSION,
-            t: t_capture_end,
-            utterance_id: format!("w{utt}"),
-            speaker: cfg.speaker.clone(),
-            text: out.text,
-            stt_latency_ms: Some(stt_ms),
-        };
-        emit(tx, cfg.print_stdout, &ev);
-    }
-    Ok(())
-}
-
-fn stream_mic(
-    cfg: &Config,
-    stt: &Stt,
-    tx: &broadcast::Sender<String>,
-    t0: Instant,
-) -> Result<()> {
-    let (rx, info) = audio::open_default_mic()?;
-    eprintln!(
-        "[mic] capturing: {} Hz, {} ch (default input device)",
-        info.sample_rate, info.channels
-    );
-    let window_samples_dev = (cfg.window_ms as usize * info.sample_rate as usize) / 1000;
-    let deadline = cfg.duration_s.map(|s| Instant::now() + Duration::from_secs(s));
-    let mut buf: Vec<f32> = Vec::with_capacity(window_samples_dev * 2);
-    let mut utt = 0u32;
-
-    loop {
-        if let Some(dl) = deadline {
-            if Instant::now() >= dl {
-                break;
+        match engine.suggest(now_ms(t0)) {
+            Ok((evs, lat)) => {
+                eprintln!("[suggest] {} prompt(s) in {lat} ms", evs.len());
+                for ev in &evs {
+                    emit(&tx, print, ev);
+                }
             }
+            Err(e) => eprintln!("[suggest] error: {e:#}"),
         }
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(chunk) => buf.extend_from_slice(&chunk),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-        }
-        if buf.len() < window_samples_dev {
-            continue;
-        }
-        let window: Vec<f32> = buf.drain(..window_samples_dev).collect();
-        let rms = (window.iter().map(|x| x * x).sum::<f32>() / window.len() as f32).sqrt();
-        let audio16 = resample::resample_linear(&window, info.sample_rate, 16000);
-        let t_capture_end = now_ms(t0);
-        let started = Instant::now();
-        let out = stt.transcribe(&audio16)?;
-        let stt_ms = started.elapsed().as_millis() as u64;
-        eprintln!(
-            "[mic] window: rms={rms:.4} stt={stt_ms}ms text={:?}",
-            out.text
-        );
-        if souffleur_engine::stt::is_nonspeech(&out.text) {
-            continue;
-        }
-        utt += 1;
-        let ev = Event::TranscriptFinal {
-            version: PROTOCOL_VERSION,
-            t: t_capture_end,
-            utterance_id: format!("m{utt}"),
-            speaker: cfg.speaker.clone(),
-            text: out.text,
-            stt_latency_ms: Some(stt_ms),
-        };
-        emit(tx, cfg.print_stdout, &ev);
     }
-    Ok(())
 }
 
 async fn handle_client(
@@ -329,8 +227,6 @@ async fn handle_client(
             }
         }
     });
-
-    // Drain inbound (control messages) until the socket closes.
     while let Some(msg) = read.next().await {
         match msg {
             Ok(Message::Close(_)) | Err(_) => break,
@@ -346,40 +242,140 @@ async fn handle_client(
 async fn main() -> Result<()> {
     let cfg = match parse_args()? {
         Some(c) => c,
-        None => return Ok(()), // --list-devices already printed
+        None => return Ok(()),
     };
 
     eprintln!("[core] loading model {} ...", cfg.model);
-    let stt = Stt::load(&cfg.model, cfg.threads)?;
+    let stt = Arc::new(Stt::load(&cfg.model, cfg.threads)?);
+    let model_label = stt.model_label().to_string();
     let t0 = Instant::now();
-
-    let (tx, _keepalive) = broadcast::channel::<String>(1024);
+    let (tx, _keepalive) = broadcast::channel::<String>(2048);
     let surfaces = Arc::new(AtomicUsize::new(0));
 
-    // Capture + STT loop on a dedicated blocking thread.
-    {
-        let cfg = cfg.clone();
-        let tx = tx.clone();
-        let surfaces = surfaces.clone();
-        std::thread::Builder::new()
-            .name("souffleur-capture-loop".into())
-            .spawn(move || {
-                if let Err(e) = capture_loop(cfg, stt, tx, t0, surfaces) {
-                    eprintln!("[capture] fatal: {e:#}");
+    // Suggestion worker (honest degradation: if Ollama/model is unavailable,
+    // run transcript-only rather than fabricating prompts).
+    let (sug_tx, sug_rx) = crossbeam_channel::unbounded::<(String, String)>();
+    if cfg.no_suggest {
+        eprintln!("[suggest] disabled (--no-suggest)");
+    } else {
+        let engine = SuggestionEngine::new(SuggestConfig {
+            model: cfg.suggest_model.clone(),
+            ..Default::default()
+        });
+        match engine.check() {
+            Ok(()) => {
+                match engine.warmup() {
+                    Ok(ms) => eprintln!("[suggest] using local model {} (warm in {ms} ms)", cfg.suggest_model),
+                    Err(e) => eprintln!("[suggest] using local model {} (warmup failed: {e:#})", cfg.suggest_model),
                 }
-            })
-            .context("spawn capture loop")?;
+                let tx = tx.clone();
+                let print = cfg.print_stdout;
+                std::thread::Builder::new()
+                    .name("souffleur-suggest".into())
+                    .spawn(move || suggestion_worker(engine, sug_rx, tx, t0, print))
+                    .context("spawn suggestion worker")?;
+            }
+            Err(e) => eprintln!("[suggest] disabled: {e:#}  (transcript-only)"),
+        }
     }
 
+    // Bind + accept connections first, so surfaces can attach before capture.
     let listener = TcpListener::bind(&cfg.bind)
         .await
         .with_context(|| format!("bind {}", cfg.bind))?;
     eprintln!("[core] Coach Protocol WS listening on ws://{}", cfg.bind);
-
-    loop {
-        let (stream, _) = listener.accept().await.context("accept")?;
+    let _ = PROTOCOL_VERSION;
+    {
         let tx = tx.clone();
         let surfaces = surfaces.clone();
-        tokio::spawn(handle_client(stream, tx, surfaces));
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        tokio::spawn(handle_client(stream, tx.clone(), surfaces.clone()));
+                    }
+                    Err(e) => {
+                        eprintln!("[ws] accept error: {e}");
+                        break;
+                    }
+                }
+            }
+        });
     }
+
+    // Optionally hold capture until a surface is watching (don't coach to nobody).
+    if cfg.wait_surface {
+        eprintln!("[core] waiting for a surface to connect...");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while surfaces.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        eprintln!(
+            "[core] {} surface(s) connected; starting capture",
+            surfaces.load(Ordering::Relaxed)
+        );
+    }
+
+    // Capture + streaming threads, one per channel.
+    let channels = build_channels(&cfg)?;
+    let mut handles = Vec::new();
+    for (speaker, rx) in channels {
+        let streamer = StreamingStt::new(stt.clone(), speaker, StreamConfig::default());
+        let tx = tx.clone();
+        let sug_tx = sug_tx.clone();
+        let print = cfg.print_stdout;
+        let h = std::thread::Builder::new()
+            .name("souffleur-channel".into())
+            .spawn(move || channel_loop(rx, streamer, tx, sug_tx, t0, print))
+            .context("spawn channel loop")?;
+        handles.push(h);
+    }
+    drop(sug_tx); // channels hold their own clones; this lets the worker end when they do
+
+    // State heartbeat: drives the surface's status pill / model / surface count.
+    {
+        let tx = tx.clone();
+        let surfaces = surfaces.clone();
+        let model = model_label.clone();
+        tokio::spawn(async move {
+            loop {
+                let ev = Event::State {
+                    version: PROTOCOL_VERSION,
+                    t: now_ms(t0),
+                    capturing: true,
+                    model: model.clone(),
+                    e2e_latency_ms: None,
+                    consent_disclosed: false,
+                    surfaces: surfaces.load(Ordering::Relaxed) as u32,
+                };
+                if let Ok(line) = ev.to_ndjson() {
+                    let _ = tx.send(line);
+                }
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        });
+    }
+
+    // Exit policy: --duration-s stops live modes; --once exits when sources end.
+    if let Some(secs) = cfg.duration_s {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(secs));
+            eprintln!("[core] duration {secs}s elapsed; exiting");
+            std::process::exit(0);
+        });
+    }
+    if cfg.once {
+        std::thread::spawn(move || {
+            for h in handles {
+                let _ = h.join();
+            }
+            std::thread::sleep(Duration::from_millis(800)); // let suggestions flush
+            eprintln!("[core] sources done (--once); exiting");
+            std::process::exit(0);
+        });
+    }
+
+    // Keep the runtime alive; --once/--duration exit via process::exit.
+    std::future::pending::<()>().await;
+    Ok(())
 }
