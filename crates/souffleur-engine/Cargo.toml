@@ -1,0 +1,32 @@
+[package]
+name = "souffleur-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Souffleur core engine: audio capture, streaming STT, and the latency harness"
+
+[dependencies]
+souffleur-protocol = { path = "../souffleur-protocol" }
+anyhow.workspace = true
+serde_json.workspace = true
+whisper-rs = "0.14"
+hound = "3"
+
+# --- Stage B: live capture + WebSocket daemon ---
+cpal = "0.15"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+crossbeam-channel = "0.5"
+
+[[bin]]
+name = "latency-harness"
+path = "src/bin/latency_harness.rs"
+
+[[bin]]
+name = "souffleur-core"
+path = "src/bin/souffleur_core.rs"
+
+[[bin]]
+name = "ws-tap"
+path = "src/bin/ws_tap.rs"

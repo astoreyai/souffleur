@@ -1,0 +1,10 @@
+[package]
+name = "souffleur-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Coach Protocol v0 — the core<->surface event contract for Souffleur"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

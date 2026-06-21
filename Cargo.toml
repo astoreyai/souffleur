@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/souffleur-protocol",
+    "crates/souffleur-engine",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = ""
+rust-version = "1.80"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
