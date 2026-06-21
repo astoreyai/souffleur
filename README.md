@@ -36,6 +36,14 @@ cargo build
 cargo test --workspace        # offline + device-free; no model or network needed
 ```
 
+CI runs on GitHub Actions (`.github/workflows/ci.yml`): fmt, clippy `-D warnings`, the full
+test suite, and an MSRV check. To run the identical gate locally before pushing:
+
+```bash
+./scripts/ci.sh                          # fmt + clippy + test, same as CI
+git config core.hooksPath .githooks      # optional: run it automatically on every push
+```
+
 ### Run the core
 
 The core binds `127.0.0.1:8123` by default and speaks the Coach Protocol (NDJSON over WebSocket).
