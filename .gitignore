@@ -1,0 +1,56 @@
+# --- Secrets / credentials (NEVER commit) ---
+.env
+.env.*
+*.key
+*.pem
+secrets/
+config.local.*
+**/credentials*.json
+
+# --- Node / TypeScript ---
+node_modules/
+dist/
+build/
+.next/
+*.tsbuildinfo
+.turbo/
+coverage/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# --- Rust / Tauri ---
+target/
+src-tauri/target/
+
+# --- Models / weights / large media (real data stays local) ---
+*.gguf
+*.bin
+*.onnx
+*.pt
+*.safetensors
+models/
+*.wav
+*.mp3
+*.m4a
+*.flac
+recordings/
+captures/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+
+# --- Local scratch ---
+scratch/
+tmp/
