@@ -48,7 +48,7 @@ jobs:
         run: cargo test --workspace --locked
 
   msrv:
-    name: msrv check (1.80)
+    name: msrv check (1.86)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -57,10 +57,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake clang libclang-dev pkg-config libasound2-dev
-      # Verifies the rust-version declared in Cargo.toml actually builds. If a
-      # dependency raises the floor above 1.80, this job is where it shows up;
-      # bump workspace.package.rust-version to match.
-      - uses: dtolnay/rust-toolchain@1.80.0
+      # Verifies the rust-version declared in Cargo.toml actually builds. The
+      # floor is 1.86: icu 2.2 (pulled via idna -> url) requires rustc 1.86, and
+      # zeroize 1.9 is edition 2024 (>= 1.85). Verified locally with the 1.86
+      # toolchain. If a dep raises the floor again, this job catches it; bump
+      # workspace.package.rust-version to match.
+      - uses: dtolnay/rust-toolchain@1.86.0
       - uses: Swatinem/rust-cache@v2
       - name: check
         run: cargo check --workspace --locked

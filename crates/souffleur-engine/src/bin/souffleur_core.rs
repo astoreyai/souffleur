@@ -356,6 +356,10 @@ fn query_token(q: &str) -> Option<&str> {
     q.split('&').find_map(|p| p.strip_prefix("token="))
 }
 
+// The WS-accept callback must return `Result<Response, ErrorResponse>` — the
+// shape tungstenite's `accept_hdr_async` dictates — so the large Err variant is
+// not ours to box away.
+#[allow(clippy::result_large_err)]
 async fn handle_client(
     stream: tokio::net::TcpStream,
     tx: broadcast::Sender<String>,
