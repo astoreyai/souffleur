@@ -58,10 +58,10 @@ Non-fatal core-side problem the surface should show (device lost, model load fai
 
 1. **Partials are cosmetic; finals are causal.** Only `transcript.final` triggers suggestions. Prevents flicker-driven bad prompts.
 2. **The core never renders.** It only emits events. All layout/pagination/length-fitting lives in the surface (a glasses surface paginates to its line count; an overlay wraps to its width).
-3. **Localhost by default.** The transcript stream is sensitive; binding beyond loopback requires an explicit flag and (later) a token.
+3. **Localhost by default.** The transcript stream is sensitive; binding beyond loopback requires BOTH `--listen-lan` AND a shared secret (`--token` / `$SOUFFLEUR_TOKEN`), which the core checks at the WebSocket handshake (surfaces connect with `ws://HOST:PORT/?token=<secret>`). A bare non-loopback `--bind` is refused.
 4. **Surfaces are stateless-friendly.** A surface can connect mid-session and render correctly from the next `state` + subsequent events; it must not depend on having seen the whole history.
 5. **Backpressure:** the core coalesces — at most ~3 `prompt`/s and ~1 `state`/s; a glasses surface further coalesces to the device's 300 ms display floor.
 
 ## Phase 0 subset
 
-Phase 0 implements `transcript.partial`, `transcript.final` (with real `stt_latency_ms`), and `state`. `prompt` arrives in Phase 1 (suggestion engine); the uplink and `error` are stubbed-free placeholders in the type system but only `transcript.*`/`state` are emitted until then.
+The core emits `transcript.partial`, `transcript.final` (with real `stt_latency_ms`), `prompt` (suggestion engine), `state` (heartbeat with real `capturing` + `consent_disclosed`), and `error` (e.g. `audio_device_lost`, `suggest_unavailable`). On the uplink, the core consumes `set_consent` (drives the `consent_disclosed` reported in `state`); `dismiss`/`hint`/`ack` are accepted and logged but not yet acted on.

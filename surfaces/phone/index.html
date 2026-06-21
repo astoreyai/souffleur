@@ -139,8 +139,9 @@
       case "state":
         modelEl.textContent = ev.model ? "· " + ev.model : "";
         setStatus(true, ev.capturing ? "listening" : "idle");
+        if (typeof ev.consent_disclosed === "boolean") setConsentUI(ev.consent_disclosed, false);
         break;
-      case "error": setStatus(true, "error: " + (ev.code || "")); break;
+      case "error": setStatus(true, "error: " + (ev.message || ev.code || "")); break;
     }
   }
 
@@ -155,14 +156,18 @@
   }
   connect();
 
-  // Consent toggle (sends a control message upstream; surfaces may also just display it).
+  // Consent toggle: announce the assistant. The daemon is the source of truth —
+  // it echoes consent_disclosed in every `state`, which syncs the toggle here.
   let disclosed = false;
-  $("consent").addEventListener("click", () => {
-    disclosed = !disclosed;
-    $("consent").classList.toggle("on", disclosed);
-    $("consent-label").textContent = disclosed ? "assistant disclosed" : "assistant not disclosed";
-    if (sock && sock.readyState === 1) sock.send(JSON.stringify({ v: 0, type: "set_consent", disclosed }));
-  });
+  function setConsentUI(d, send) {
+    disclosed = d;
+    $("consent").classList.toggle("on", d);
+    $("consent-label").textContent = d ? "assistant disclosed" : "assistant not disclosed";
+    if (send && sock && sock.readyState === 1) {
+      sock.send(JSON.stringify({ v: 0, type: "set_consent", disclosed: d }));
+    }
+  }
+  $("consent").addEventListener("click", () => setConsentUI(!disclosed, true));
 
   // Best-effort PWA service worker (ignored if unavailable).
   if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});

@@ -14,13 +14,16 @@ use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::Receiver;
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
 const SR: u32 = 16_000;
 
-/// Live microphone, resampled to 16 kHz mono. Returns the chunk receiver.
-pub fn spawn_mic() -> Result<Receiver<Vec<f32>>> {
-    let (dev_rx, info) = audio::open_default_mic()?;
+/// Live microphone, resampled to 16 kHz mono. Returns the chunk receiver and an
+/// `alive` flag the daemon polls — it flips to `false` if the device fails.
+pub fn spawn_mic() -> Result<(Receiver<Vec<f32>>, Arc<AtomicBool>)> {
+    let (dev_rx, info, alive) = audio::open_default_mic()?;
     eprintln!(
         "[source:mic] {} Hz, {} ch (default input) -> 16k mono",
         info.sample_rate, info.channels
@@ -38,7 +41,7 @@ pub fn spawn_mic() -> Result<Receiver<Vec<f32>>> {
             }
         })
         .context("spawn mic source")?;
-    Ok(rx)
+    Ok((rx, alive))
 }
 
 /// The default sink's monitor source name, e.g. `<sink>.monitor`.

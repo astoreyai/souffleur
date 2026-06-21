@@ -18,6 +18,9 @@ fn main() -> Result<()> {
     let wav = args.get(2).map(String::as_str).unwrap_or("assets/jfk.wav");
     let n_threads: i32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8);
     let runs: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(5);
+    if runs == 0 {
+        anyhow::bail!("RUNS must be >= 1");
+    }
 
     // --- Load the real WAV ---
     let mut reader = hound::WavReader::open(wav).with_context(|| format!("open wav {wav}"))?;

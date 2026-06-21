@@ -68,7 +68,7 @@ The transcript is sub-second; the confirmed-final + prompt is ~2–2.5 s. `hold_
 2. **"Both sides with real speech on both channels" not shown in one run** — me channel was silent (headless box). Components each verified; a real call exercises both.
 3. **Linear resampler** still in use (base.en handles it; swap to windowed-sinc only if WER demands).
 4. **STT on CPU** (24× RTF, fine); GPU-whisper is an available future optimization.
-5. **Phone surface needs a LAN/Tailscale bind** (`--bind 0.0.0.0:8123`) for a real phone; localhost-only by default for transcript privacy.
+5. **Phone surface needs a LAN/Tailscale bind for a real phone** — localhost-only by default. A non-loopback bind is refused unless you opt in with `--listen-lan` AND a shared secret (`--token <secret>` / `$SOUFFLEUR_TOKEN`); the phone then connects with `ws://HOST:8123/?token=<secret>`. Prefer a Tailscale address over `0.0.0.0`.
 6. **Suggestion fires per final (debounced)**; smarter triggering (only-when-useful, dedupe) is a refinement.
 
 ## How to run
@@ -81,5 +81,6 @@ cargo run --release --bin souffleur-core -- --mode duplex --wait-surface
 # Terminal B — serve the phone surface:
 scripts/serve-phone.sh 8080
 # On your phone (same Tailnet/LAN), open:
-#   http://<host>:8080/?ws=ws://<host>:8123     (run core with --bind 0.0.0.0:8123)
+#   http://<host>:8080/?ws=ws://<host>:8123/?token=<secret>
+#   (run core with: --bind <tailscale-ip>:8123 --listen-lan --token <secret>)
 ```

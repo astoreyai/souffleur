@@ -10,6 +10,8 @@
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Metadata about a started capture stream.
 #[derive(Debug, Clone, Copy)]
@@ -45,13 +47,13 @@ pub fn list_input_devices() -> Result<Vec<String>> {
 /// and is kept alive until the process exits (cpal streams are not `Send` on all
 /// hosts, so we never move it across threads). Returns the device's real sample
 /// rate / channel count.
-pub fn spawn_default_mic_capture(tx: Sender<Vec<f32>>) -> Result<CaptureInfo> {
+pub fn spawn_default_mic_capture(tx: Sender<Vec<f32>>, alive: Arc<AtomicBool>) -> Result<CaptureInfo> {
     let (init_tx, init_rx) = crossbeam_channel::bounded::<Result<CaptureInfo>>(1);
 
     std::thread::Builder::new()
         .name("souffleur-capture".into())
         .spawn(move || {
-            let built = build_and_play(tx);
+            let built = build_and_play(tx, alive);
             match built {
                 Ok((info, stream)) => {
                     // Hold the stream for the process lifetime (cpal's callback runs
@@ -74,7 +76,7 @@ pub fn spawn_default_mic_capture(tx: Sender<Vec<f32>>) -> Result<CaptureInfo> {
         .context("capture thread init channel closed")?
 }
 
-fn build_and_play(tx: Sender<Vec<f32>>) -> Result<(CaptureInfo, cpal::Stream)> {
+fn build_and_play(tx: Sender<Vec<f32>>, alive: Arc<AtomicBool>) -> Result<(CaptureInfo, cpal::Stream)> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -87,7 +89,12 @@ fn build_and_play(tx: Sender<Vec<f32>>) -> Result<(CaptureInfo, cpal::Stream)> {
         channels: supported.channels(),
     };
     let channels = info.channels as usize;
-    let err_fn = |e| eprintln!("[capture] stream error: {e}");
+    // On a stream error (e.g. the device disappears) flip `alive` so the daemon
+    // can surface it instead of silently going deaf.
+    let err_fn = move |e| {
+        eprintln!("[capture] stream error: {e}");
+        alive.store(false, Ordering::Relaxed);
+    };
     let config: cpal::StreamConfig = supported.clone().into();
 
     let stream = match supported.sample_format() {
@@ -133,9 +140,11 @@ fn downmix_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Convenience: a receiver paired to a freshly started default-mic capture.
-pub fn open_default_mic() -> Result<(Receiver<Vec<f32>>, CaptureInfo)> {
+/// Convenience: a receiver paired to a freshly started default-mic capture, plus
+/// an `alive` flag the cpal error callback flips to `false` if the device fails.
+pub fn open_default_mic() -> Result<(Receiver<Vec<f32>>, CaptureInfo, Arc<AtomicBool>)> {
     let (tx, rx) = crossbeam_channel::unbounded::<Vec<f32>>();
-    let info = spawn_default_mic_capture(tx)?;
-    Ok((rx, info))
+    let alive = Arc::new(AtomicBool::new(true));
+    let info = spawn_default_mic_capture(tx, alive.clone())?;
+    Ok((rx, info, alive))
 }

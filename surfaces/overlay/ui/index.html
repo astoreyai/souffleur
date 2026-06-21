@@ -108,7 +108,14 @@
       case "transcript.partial": showPartial(ev.speaker, ev.text); break;
       case "transcript.final": addFinal(ev.speaker, ev.text); break;
       case "prompt": addPrompt(ev); break;
-      case "state": modelEl.textContent = ev.model?"· "+ev.model:""; dot.classList.add("on"); break;
+      case "state":
+        modelEl.textContent = ev.model ? "· " + ev.model : "";
+        dot.classList.toggle("on", ev.capturing !== false);
+        break;
+      case "error":
+        dot.classList.remove("on");
+        modelEl.textContent = "· " + (ev.message || ev.code || "error");
+        break;
     }
   }
   let sock;
