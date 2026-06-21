@@ -1,7 +1,6 @@
 # Souffleur
 
 [![ci](https://github.com/astoreyai/souffleur/actions/workflows/ci.yml/badge.svg)](https://github.com/astoreyai/souffleur/actions/workflows/ci.yml)
-[![license: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 
 > *A souffleur is the theatre prompter who, unseen from the audience, whispers an actor's next line.*
 
