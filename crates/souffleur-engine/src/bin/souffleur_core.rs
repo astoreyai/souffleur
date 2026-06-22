@@ -196,6 +196,15 @@ fn emit(tx: &broadcast::Sender<String>, print: bool, ev: &Event) {
 /// A capture channel: its speaker, audio stream, and optional device-alive flag.
 type Channel = (Speaker, Receiver<Vec<f32>>, Option<Arc<AtomicBool>>);
 
+/// (turn-sender that channels push confirmed turns into, suggestion-worker handle).
+type SuggestionWorker = (
+    crossbeam_channel::Sender<(String, String)>,
+    Option<std::thread::JoinHandle<()>>,
+);
+
+/// (per-channel capture join handles, device-alive flags for the loss watcher).
+type CaptureHandles = (Vec<std::thread::JoinHandle<()>>, Vec<Arc<AtomicBool>>);
+
 /// Build the capture channels for the configured mode.
 fn build_channels(cfg: &Config) -> Result<Vec<Channel>> {
     Ok(match &cfg.mode {
@@ -455,128 +464,137 @@ async fn handle_client(
     eprintln!("[ws] surface disconnected: {peer} (surfaces={count})");
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cfg = match parse_args()? {
-        Some(c) => c,
-        None => return Ok(()),
-    };
+/// Coordinates graceful shutdown: any trigger flips the flag and wakes the drain.
+#[derive(Clone)]
+struct Shutdown {
+    shared: Arc<Shared>,
+    notify: Arc<Notify>,
+}
 
-    eprintln!("[core] loading model {} ...", cfg.model);
-    let stt = Arc::new(Stt::load(&cfg.model, cfg.threads)?);
-    let model_label = stt.model_label().to_string();
-    let t0 = Instant::now();
-    let (tx, _keepalive) = broadcast::channel::<String>(2048);
-    let shared = Arc::new(Shared {
-        surfaces: AtomicUsize::new(0),
-        active_channels: AtomicUsize::new(0),
-        capturing: AtomicBool::new(false),
-        consent_disclosed: AtomicBool::new(false),
-        shutdown: AtomicBool::new(false),
-    });
-    let notify = Arc::new(Notify::new());
-    let token = cfg.token.clone().map(Arc::new);
+impl Shutdown {
+    /// Signal all loops to stop and wake the main drain.
+    fn trigger(&self, reason: &str) {
+        eprintln!("[core] {reason}; shutting down");
+        self.shared.shutdown.store(true, Ordering::Relaxed);
+        self.notify.notify_one();
+    }
+    /// Block until a shutdown is triggered, then confirm the flag.
+    async fn wait(&self) {
+        self.notify.notified().await;
+        self.shared.shutdown.store(true, Ordering::Relaxed);
+    }
+}
 
-    // Suggestion worker (honest degradation: if Ollama/model is unavailable, run
-    // transcript-only rather than fabricating prompts).
+/// Build the suggestion backend (+ optional corpus) and spawn the worker thread.
+/// Returns the turn-sender (channels push confirmed turns into it) and the worker
+/// handle. On any non-fatal failure it degrades to transcript-only: the sender is
+/// still returned (channel_loop's sends become no-ops) and the handle is `None`.
+/// A `--corpus` that cannot be ingested is fatal (propagated), since the user
+/// asked for grounding and silent un-grounded coaching would be dishonest.
+fn spawn_suggestion(
+    cfg: &Config,
+    tx: &broadcast::Sender<String>,
+    t0: Instant,
+    shared: &Arc<Shared>,
+) -> Result<SuggestionWorker> {
     let (sug_tx, sug_rx) = crossbeam_channel::unbounded::<(String, String)>();
-    let mut suggest_handle: Option<std::thread::JoinHandle<()>> = None;
     if cfg.no_suggest {
         eprintln!("[suggest] disabled (--no-suggest)");
-    } else {
-        match make_backend(&cfg.suggest_backend, cfg.suggest_model.clone()) {
-            Ok(backend) => {
-                let mut engine = SuggestionEngine::new(backend, SuggestConfig::default());
-                if let Some(dir) = &cfg.corpus {
-                    let corpus =
-                        souffleur_engine::corpus::Corpus::ingest(std::path::Path::new(dir))
-                            .with_context(|| format!("ingest --corpus {dir}"))?;
-                    eprintln!(
-                        "[corpus] {} chunks from {} files in {dir} (cues will be grounded in your documents)",
-                        corpus.len(),
-                        corpus.sources()
-                    );
-                    engine.set_corpus(corpus);
-                }
-                let bname = engine.backend_name().to_string();
-                let is_cloud = engine.is_cloud();
-                match engine.check() {
-                    Ok(()) => {
-                        match engine.warmup() {
-                            Ok(ms) => {
-                                eprintln!("[suggest] backend {bname} ready (warm in {ms} ms)")
-                            }
-                            Err(e) => eprintln!("[suggest] backend {bname} ready (warmup: {e:#})"),
-                        }
-                        if is_cloud {
-                            eprintln!("[suggest] CLOUD backend — transcript is sent off-device ONLY after consent is disclosed");
-                        }
-                        let tx = tx.clone();
-                        let print = cfg.print_stdout;
-                        let shared = shared.clone();
-                        suggest_handle = Some(
-                            std::thread::Builder::new()
-                                .name("souffleur-suggest".into())
-                                .spawn(move || {
-                                    suggestion_worker(engine, sug_rx, tx, t0, print, shared)
-                                })
-                                .context("spawn suggestion worker")?,
-                        );
-                    }
-                    Err(e) => eprintln!("[suggest] disabled: {e:#}  (transcript-only)"),
-                }
-            }
-            Err(e) => eprintln!("[suggest] disabled: {e:#}  (transcript-only)"),
+        return Ok((sug_tx, None));
+    }
+    let backend = match make_backend(&cfg.suggest_backend, cfg.suggest_model.clone()) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[suggest] disabled: {e:#}  (transcript-only)");
+            return Ok((sug_tx, None));
         }
-    }
-
-    // Bind + accept connections first, so surfaces can attach before capture.
-    let listener = TcpListener::bind(&cfg.bind)
-        .await
-        .with_context(|| format!("bind {}", cfg.bind))?;
-    eprintln!("[core] Coach Protocol WS listening on ws://{}", cfg.bind);
-    if !is_loopback_bind(&cfg.bind) {
-        eprintln!("[core] WARNING: bound to a non-loopback address; token auth REQUIRED, transcript leaves this host on the LAN");
-    }
-    {
-        let tx = tx.clone();
-        let shared = shared.clone();
-        let token = token.clone();
-        tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        tokio::spawn(handle_client(
-                            stream,
-                            tx.clone(),
-                            shared.clone(),
-                            token.clone(),
-                        ));
-                    }
-                    Err(e) => {
-                        eprintln!("[ws] accept error: {e}");
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
-    // Optionally hold capture until a surface is watching (don't coach to nobody).
-    if cfg.wait_surface {
-        eprintln!("[core] waiting for a surface to connect...");
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while shared.surfaces.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+    };
+    let mut engine = SuggestionEngine::new(backend, SuggestConfig::default());
+    if let Some(dir) = &cfg.corpus {
+        let corpus = souffleur_engine::corpus::Corpus::ingest(std::path::Path::new(dir))
+            .with_context(|| format!("ingest --corpus {dir}"))?;
         eprintln!(
-            "[core] {} surface(s) connected; starting capture",
-            shared.surfaces.load(Ordering::Relaxed)
+            "[corpus] {} chunks from {} files in {dir} (cues will be grounded in your documents)",
+            corpus.len(),
+            corpus.sources()
         );
+        engine.set_corpus(corpus);
     }
+    let bname = engine.backend_name().to_string();
+    let is_cloud = engine.is_cloud();
+    if let Err(e) = engine.check() {
+        eprintln!("[suggest] disabled: {e:#}  (transcript-only)");
+        return Ok((sug_tx, None));
+    }
+    match engine.warmup() {
+        Ok(ms) => eprintln!("[suggest] backend {bname} ready (warm in {ms} ms)"),
+        Err(e) => eprintln!("[suggest] backend {bname} ready (warmup: {e:#})"),
+    }
+    if is_cloud {
+        eprintln!("[suggest] CLOUD backend — transcript is sent off-device ONLY after consent is disclosed");
+    }
+    let tx = tx.clone();
+    let print = cfg.print_stdout;
+    let shared = shared.clone();
+    let handle = std::thread::Builder::new()
+        .name("souffleur-suggest".into())
+        .spawn(move || suggestion_worker(engine, sug_rx, tx, t0, print, shared))
+        .context("spawn suggestion worker")?;
+    Ok((sug_tx, Some(handle)))
+}
 
-    // Capture + streaming threads, one per channel.
-    let channels = build_channels(&cfg)?;
+/// Spawn the accept loop: each TCP connection becomes a Coach Protocol client.
+fn spawn_accept_loop(
+    listener: TcpListener,
+    tx: broadcast::Sender<String>,
+    shared: Arc<Shared>,
+    token: Option<Arc<String>>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    tokio::spawn(handle_client(
+                        stream,
+                        tx.clone(),
+                        shared.clone(),
+                        token.clone(),
+                    ));
+                }
+                Err(e) => {
+                    eprintln!("[ws] accept error: {e}");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Optionally hold capture until a surface connects (don't coach to nobody).
+async fn wait_for_surface(shared: &Arc<Shared>) {
+    eprintln!("[core] waiting for a surface to connect...");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while shared.surfaces.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    eprintln!(
+        "[core] {} surface(s) connected; starting capture",
+        shared.surfaces.load(Ordering::Relaxed)
+    );
+}
+
+/// Spawn one capture+streaming thread per channel. Returns the join handles and
+/// the device-alive flags (consumed by the device-loss watcher).
+fn spawn_capture(
+    cfg: &Config,
+    stt: Arc<Stt>,
+    tx: &broadcast::Sender<String>,
+    sug_tx: &crossbeam_channel::Sender<(String, String)>,
+    t0: Instant,
+    shared: &Arc<Shared>,
+    notify: &Arc<Notify>,
+) -> Result<CaptureHandles> {
+    let channels = build_channels(cfg)?;
     shared
         .active_channels
         .store(channels.len(), Ordering::Relaxed);
@@ -600,84 +618,96 @@ async fn main() -> Result<()> {
             .context("spawn channel loop")?;
         handles.push(h);
     }
-    drop(sug_tx); // main keeps no sender; the worker ends once all channels drop theirs
+    Ok((handles, alive_flags))
+}
 
-    // State heartbeat: real capturing + consent, model, surface count.
-    {
-        let tx = tx.clone();
-        let shared = shared.clone();
-        let model = model_label.clone();
-        tokio::spawn(async move {
-            loop {
-                let ev = Event::State {
-                    version: PROTOCOL_VERSION,
-                    t: now_ms(t0),
-                    capturing: shared.capturing.load(Ordering::Relaxed),
-                    model: model.clone(),
-                    e2e_latency_ms: None,
-                    consent_disclosed: shared.consent_disclosed.load(Ordering::Relaxed),
-                    surfaces: shared.surfaces.load(Ordering::Relaxed) as u32,
-                };
-                if let Ok(line) = ev.to_ndjson() {
-                    let _ = tx.send(line);
-                }
-                tokio::time::sleep(Duration::from_secs(3)).await;
+/// Spawn the state heartbeat: capturing + consent + model + surface count, every 3s.
+fn spawn_heartbeat(
+    tx: broadcast::Sender<String>,
+    shared: Arc<Shared>,
+    model_label: String,
+    t0: Instant,
+) {
+    tokio::spawn(async move {
+        loop {
+            let ev = Event::State {
+                version: PROTOCOL_VERSION,
+                t: now_ms(t0),
+                capturing: shared.capturing.load(Ordering::Relaxed),
+                model: model_label.clone(),
+                e2e_latency_ms: None,
+                consent_disclosed: shared.consent_disclosed.load(Ordering::Relaxed),
+                surfaces: shared.surfaces.load(Ordering::Relaxed) as u32,
+            };
+            if let Ok(line) = ev.to_ndjson() {
+                let _ = tx.send(line);
             }
-        });
-    }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    });
+}
 
-    // Device-loss watcher: if a mic stream errors out, surface it once.
-    if !alive_flags.is_empty() {
-        let tx = tx.clone();
-        let print = cfg.print_stdout;
-        tokio::spawn(async move {
-            let mut reported = false;
-            loop {
-                if !reported && alive_flags.iter().any(|a| !a.load(Ordering::Relaxed)) {
-                    reported = true;
-                    emit(
-                        &tx,
-                        print,
-                        &Event::Error {
-                            version: PROTOCOL_VERSION,
-                            t: now_ms(t0),
-                            code: "audio_device_lost".into(),
-                            message: "an input device stopped delivering audio".into(),
-                            fatal: false,
-                        },
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+/// If any input device stops delivering audio, emit one non-fatal Error event.
+fn spawn_device_watcher(
+    alive_flags: Vec<Arc<AtomicBool>>,
+    tx: broadcast::Sender<String>,
+    t0: Instant,
+    print: bool,
+) {
+    if alive_flags.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut reported = false;
+        loop {
+            if !reported && alive_flags.iter().any(|a| !a.load(Ordering::Relaxed)) {
+                reported = true;
+                emit(
+                    &tx,
+                    print,
+                    &Event::Error {
+                        version: PROTOCOL_VERSION,
+                        t: now_ms(t0),
+                        code: "audio_device_lost".into(),
+                        message: "an input device stopped delivering audio".into(),
+                        fatal: false,
+                    },
+                );
             }
-        });
-    }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+}
 
-    // Shutdown triggers, all funnelled through `notify` + the shutdown flag.
+/// Wire the shutdown triggers (duration timeout, ctrl-c) into `shutdown`.
+/// (The `--once` path triggers from inside `channel_loop` when the last channel ends.)
+fn spawn_shutdown_triggers(cfg: &Config, shutdown: Shutdown) {
     if let Some(secs) = cfg.duration_s {
-        let shared = shared.clone();
-        let notify = notify.clone();
+        let shutdown = shutdown.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(secs)).await;
-            eprintln!("[core] duration {secs}s elapsed; shutting down");
-            shared.shutdown.store(true, Ordering::Relaxed);
-            notify.notify_one();
+            shutdown.trigger(&format!("duration {secs}s elapsed"));
         });
     }
-    {
-        let shared = shared.clone();
-        let notify = notify.clone();
-        tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                eprintln!("[core] ctrl-c; shutting down");
-                shared.shutdown.store(true, Ordering::Relaxed);
-                notify.notify_one();
-            }
-        });
-    }
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            shutdown.trigger("ctrl-c");
+        }
+    });
+}
 
-    // Wait for shutdown, then drain gracefully.
-    notify.notified().await;
-    shared.shutdown.store(true, Ordering::Relaxed);
+/// Wait for shutdown, join capture + suggestion threads, emit a final idle state,
+/// then give the WS forwarders a moment to flush.
+async fn drain(
+    shutdown: &Shutdown,
+    handles: Vec<std::thread::JoinHandle<()>>,
+    suggest_handle: Option<std::thread::JoinHandle<()>>,
+    tx: &broadcast::Sender<String>,
+    model_label: String,
+    t0: Instant,
+    print: bool,
+) {
+    shutdown.wait().await;
     // Channel threads observe the flag, flush, and exit; join them.
     for h in handles {
         let _ = h.join();
@@ -686,11 +716,11 @@ async fn main() -> Result<()> {
     if let Some(h) = suggest_handle {
         let _ = h.join();
     }
-    // Tell surfaces capture stopped, then give the WS forwarders a moment to flush.
+    let shared = &shutdown.shared;
     shared.capturing.store(false, Ordering::Relaxed);
     emit(
-        &tx,
-        cfg.print_stdout,
+        tx,
+        print,
         &Event::State {
             version: PROTOCOL_VERSION,
             t: now_ms(t0),
@@ -703,5 +733,67 @@ async fn main() -> Result<()> {
     );
     tokio::time::sleep(Duration::from_millis(200)).await;
     eprintln!("[core] shutdown complete");
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cfg = match parse_args()? {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+
+    eprintln!("[core] loading model {} ...", cfg.model);
+    let stt = Arc::new(Stt::load(&cfg.model, cfg.threads)?);
+    let model_label = stt.model_label().to_string();
+    let t0 = Instant::now();
+    let (tx, _keepalive) = broadcast::channel::<String>(2048);
+    let shared = Arc::new(Shared {
+        surfaces: AtomicUsize::new(0),
+        active_channels: AtomicUsize::new(0),
+        capturing: AtomicBool::new(false),
+        consent_disclosed: AtomicBool::new(false),
+        shutdown: AtomicBool::new(false),
+    });
+    let notify = Arc::new(Notify::new());
+    let shutdown = Shutdown {
+        shared: shared.clone(),
+        notify: notify.clone(),
+    };
+    let token = cfg.token.clone().map(Arc::new);
+
+    let (sug_tx, suggest_handle) = spawn_suggestion(&cfg, &tx, t0, &shared)?;
+
+    // Bind + accept connections first, so surfaces can attach before capture.
+    let listener = TcpListener::bind(&cfg.bind)
+        .await
+        .with_context(|| format!("bind {}", cfg.bind))?;
+    eprintln!("[core] Coach Protocol WS listening on ws://{}", cfg.bind);
+    if !is_loopback_bind(&cfg.bind) {
+        eprintln!("[core] WARNING: bound to a non-loopback address; token auth REQUIRED, transcript leaves this host on the LAN");
+    }
+    spawn_accept_loop(listener, tx.clone(), shared.clone(), token);
+
+    // Optionally hold capture until a surface is watching (don't coach to nobody).
+    if cfg.wait_surface {
+        wait_for_surface(&shared).await;
+    }
+
+    let (handles, alive_flags) = spawn_capture(&cfg, stt, &tx, &sug_tx, t0, &shared, &notify)?;
+    drop(sug_tx); // main keeps no sender; the worker ends once all channels drop theirs
+
+    spawn_heartbeat(tx.clone(), shared.clone(), model_label.clone(), t0);
+    spawn_device_watcher(alive_flags, tx.clone(), t0, cfg.print_stdout);
+    spawn_shutdown_triggers(&cfg, shutdown.clone());
+
+    drain(
+        &shutdown,
+        handles,
+        suggest_handle,
+        &tx,
+        model_label,
+        t0,
+        cfg.print_stdout,
+    )
+    .await;
     Ok(())
 }
