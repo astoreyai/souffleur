@@ -369,6 +369,21 @@ fn query_token(q: &str) -> Option<&str> {
     q.split('&').find_map(|p| p.strip_prefix("token="))
 }
 
+/// Constant-time string equality for the LAN auth token, so a comparison's
+/// duration does not leak how many leading bytes matched. (Length is allowed to
+/// differ early — the token's length is not the secret, its bytes are.)
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 // The WS-accept callback must return `Result<Response, ErrorResponse>` — the
 // shape tungstenite's `accept_hdr_async` dictates — so the large Err variant is
 // not ours to box away.
@@ -389,7 +404,7 @@ async fn handle_client(
                 .uri()
                 .query()
                 .and_then(query_token)
-                .map(|t| t == expected.as_str())
+                .map(|t| ct_eq(t, expected.as_str()))
                 .unwrap_or(false);
             if ok {
                 Ok(resp)
@@ -796,4 +811,37 @@ async fn main() -> Result<()> {
     )
     .await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ct_eq_matches_and_rejects() {
+        assert!(ct_eq("s3cr3t", "s3cr3t"));
+        assert!(ct_eq("", ""));
+        assert!(!ct_eq("s3cr3t", "s3cr3x")); // last byte differs
+        assert!(!ct_eq("s3cr3t", "S3cr3t")); // case-sensitive
+        assert!(!ct_eq("s3cr3t", "s3cr3")); // length differs
+        assert!(!ct_eq("abc", "")); // empty vs non-empty
+    }
+
+    #[test]
+    fn query_token_extracts() {
+        assert_eq!(query_token("token=abc"), Some("abc"));
+        assert_eq!(query_token("foo=1&token=abc"), Some("abc"));
+        assert_eq!(query_token("token=abc&foo=1"), Some("abc"));
+        assert_eq!(query_token("foo=1"), None);
+        assert_eq!(query_token(""), None);
+    }
+
+    #[test]
+    fn loopback_detection() {
+        assert!(is_loopback_bind("127.0.0.1:8123"));
+        assert!(is_loopback_bind("localhost:8123"));
+        assert!(is_loopback_bind("[::1]:8123"));
+        assert!(!is_loopback_bind("0.0.0.0:8123"));
+        assert!(!is_loopback_bind("100.64.1.2:8123")); // a tailscale-style LAN addr
+    }
 }
