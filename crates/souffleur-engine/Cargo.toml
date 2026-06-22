@@ -21,6 +21,7 @@ tokio-tungstenite = "0.24"
 futures-util = "0.3"
 crossbeam-channel = "0.5"
 ureq = { version = "2", features = ["json"] }
+bincode = "1"
 
 [[bin]]
 name = "latency-harness"

@@ -9,7 +9,9 @@
 //! same `suggest_gated` chokepoint as the transcript.
 
 use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -21,6 +23,85 @@ const MIN_CHUNK_CHARS: usize = 40; // drop trivial fragments
 /// as the [`crate::suggest::OllamaBackend`] by default.
 pub fn default_ollama_url() -> String {
     std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".into())
+}
+
+// ----------------------------------------------------------------------------
+// Persistent embedding cache: so an unchanged corpus is not re-embedded on every
+// launch. Keyed per source file by (mtime, size, model); a file whose stamp is
+// unchanged reuses its stored embeddings, a changed/new file is re-embedded, and
+// a deleted file's rows are pruned. Bumped on any change to chunking.
+// ----------------------------------------------------------------------------
+
+const CACHE_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct CachedChunk {
+    text: String,
+    embedding: Vec<f32>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CacheEntry {
+    version: u32,
+    mtime_ns: u128,
+    size: u64,
+    model: String,
+    chunks: Vec<CachedChunk>,
+}
+
+type Cache = HashMap<String, CacheEntry>;
+
+/// Stable 64-bit FNV-1a hash (for naming the per-corpus cache file).
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Per-corpus cache file under `$XDG_CACHE_HOME`/`~/.cache`/`$TMPDIR`, named by a
+/// stable hash of the corpus directory's absolute path.
+fn cache_path_for(dir: &Path) -> PathBuf {
+    let abs = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+    base.push("souffleur");
+    base.push(format!(
+        "corpus-{:016x}.bin",
+        fnv1a(abs.to_string_lossy().as_bytes())
+    ));
+    base
+}
+
+fn load_cache(path: &Path) -> Cache {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| bincode::deserialize(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_cache(path: &Path, cache: &Cache) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let bytes = bincode::serialize(cache).context("serialize embedding cache")?;
+    std::fs::write(path, bytes).with_context(|| format!("write cache {}", path.display()))?;
+    Ok(())
+}
+
+fn file_stamp(path: &Path) -> Result<(u128, u64)> {
+    let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Ok((mtime_ns, meta.len()))
 }
 
 /// One embedded passage from the corpus.
@@ -132,25 +213,83 @@ impl Corpus {
                 dir.display()
             ));
         }
+        let cache_path = cache_path_for(dir);
+        let mut cache = load_cache(&cache_path);
         let mut chunks = Vec::new();
+        let (mut reused, mut embedded) = (0usize, 0usize);
+
         for f in &files {
-            let body =
-                std::fs::read_to_string(f).with_context(|| format!("read {}", f.display()))?;
+            let key = f.to_string_lossy().into_owned();
             let source = f
                 .strip_prefix(dir)
                 .unwrap_or(f)
                 .to_string_lossy()
                 .into_owned();
+            let (mtime_ns, size) = file_stamp(f)?;
+
+            // Cache hit: an unchanged file (same stamp, model, cache version) reuses
+            // its stored embeddings instead of calling the embedder again.
+            if let Some(entry) = cache.get(&key) {
+                if entry.version == CACHE_VERSION
+                    && entry.size == size
+                    && entry.mtime_ns == mtime_ns
+                    && entry.model == model
+                {
+                    for cc in &entry.chunks {
+                        chunks.push(Chunk {
+                            text: cc.text.clone(),
+                            source: source.clone(),
+                            embedding: cc.embedding.clone(),
+                        });
+                    }
+                    reused += entry.chunks.len();
+                    continue;
+                }
+            }
+
+            // Cache miss: (re)chunk + (re)embed and record the result for next time.
+            let body =
+                std::fs::read_to_string(f).with_context(|| format!("read {}", f.display()))?;
+            let mut cached = Vec::new();
             for c in chunk_text(&body) {
                 let embedding =
                     embed(&c, url, model).with_context(|| format!("embed chunk from {source}"))?;
+                cached.push(CachedChunk {
+                    text: c.clone(),
+                    embedding: embedding.clone(),
+                });
                 chunks.push(Chunk {
                     text: c,
                     source: source.clone(),
                     embedding,
                 });
+                embedded += 1;
             }
+            cache.insert(
+                key,
+                CacheEntry {
+                    version: CACHE_VERSION,
+                    mtime_ns,
+                    size,
+                    model: model.to_string(),
+                    chunks: cached,
+                },
+            );
         }
+
+        // Prune cache rows for files no longer present under dir.
+        let present: HashSet<String> = files
+            .iter()
+            .map(|f| f.to_string_lossy().into_owned())
+            .collect();
+        cache.retain(|k, _| present.contains(k));
+
+        // A cache write failure is non-fatal — ingestion already succeeded.
+        if let Err(e) = save_cache(&cache_path, &cache) {
+            eprintln!("[corpus] warning: could not write embedding cache: {e:#}");
+        }
+        eprintln!("[corpus] embeddings: {reused} reused from cache, {embedded} freshly embedded");
+
         if chunks.is_empty() {
             return Err(anyhow!("corpus produced no usable chunks"));
         }
@@ -248,6 +387,35 @@ mod tests {
         assert_eq!(chunks.len(), 2); // two big paras; trailing "x" dropped (< MIN)
         assert!(chunks[0].starts_with('A'));
         assert!(chunks[1].starts_with('B'));
+    }
+
+    #[test]
+    fn cache_entry_bincode_roundtrips() {
+        let mut map: Cache = HashMap::new();
+        map.insert(
+            "a.md".into(),
+            CacheEntry {
+                version: CACHE_VERSION,
+                mtime_ns: 123,
+                size: 45,
+                model: "nomic-embed-text".into(),
+                chunks: vec![CachedChunk {
+                    text: "hi".into(),
+                    embedding: vec![0.1, 0.2, 0.3],
+                }],
+            },
+        );
+        let bytes = bincode::serialize(&map).unwrap();
+        let back: Cache = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back["a.md"].chunks[0].embedding, vec![0.1, 0.2, 0.3]);
+        assert_eq!(back["a.md"].size, 45);
+        assert_eq!(back["a.md"].version, CACHE_VERSION);
+    }
+
+    #[test]
+    fn fnv1a_is_stable_and_distinct() {
+        assert_eq!(fnv1a(b"/home/aaron/thesis"), fnv1a(b"/home/aaron/thesis"));
+        assert_ne!(fnv1a(b"/a"), fnv1a(b"/b"));
     }
 
     #[test]
