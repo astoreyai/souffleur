@@ -53,6 +53,16 @@
   .toggle.on { background: var(--fact); }
   .toggle::after { content:""; position:absolute; top:2px; left:2px; width:18px; height:18px; border-radius:50%; background:#fff; transition:left .2s; }
   .toggle.on::after { left:18px; }
+
+  /* Grounding bar: point the coach at a folder of your own docs (RAG). */
+  #ground { display:flex; gap:8px; align-items:center; padding: 9px 12px; border-bottom:1px solid var(--line); background: var(--panel); }
+  #ground input { flex:1; min-width:0; background: var(--panel2); border:1px solid var(--line); color:var(--text);
+    border-radius:9px; padding:8px 10px; font-size:13px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #ground button { background:#243049; color:var(--text); border:1px solid var(--line); border-radius:9px;
+    padding:8px 12px; font-size:13px; font-weight:600; cursor:pointer; white-space:nowrap; }
+  #ground button:active { background:#2c3a59; }
+  #corpus-status { font-size:11.5px; color:var(--muted); white-space:nowrap; max-width:34%; overflow:hidden; text-overflow:ellipsis; }
+  #corpus-status.ok { color:var(--fact); } #corpus-status.err { color:var(--recover); }
 </style>
 </head>
 <body>
@@ -61,6 +71,13 @@
     <span class="logo">Souffleur <small id="model"></small></span>
     <span class="status" id="status">connecting…</span>
   </header>
+
+  <section id="ground">
+    <input id="corpus-path" type="text" spellcheck="false" autocapitalize="off" autocomplete="off"
+           placeholder="/path/to/your/docs (dissertation, prep notes) on the host" />
+    <button id="corpus-load">Ground</button>
+    <span id="corpus-status"></span>
+  </section>
 
   <section id="prompts"><div class="empty" id="prompts-empty">Coaching cues will appear here.</div></section>
   <div id="transcript"></div>
@@ -141,7 +158,11 @@
         setStatus(true, ev.capturing ? "listening" : "idle");
         if (typeof ev.consent_disclosed === "boolean") setConsentUI(ev.consent_disclosed, false);
         break;
-      case "error": setStatus(true, "error: " + (ev.message || ev.code || "")); break;
+      case "corpus_loaded": setCorpusStatus(`grounded: ${ev.chunks} chunks / ${ev.sources} files`, "ok"); break;
+      case "error":
+        if (ev.code === "corpus_load_failed") setCorpusStatus(ev.message || "corpus failed", "err");
+        else setStatus(true, "error: " + (ev.message || ev.code || ""));
+        break;
     }
   }
 
@@ -168,6 +189,22 @@
     }
   }
   $("consent").addEventListener("click", () => setConsentUI(!disclosed, true));
+
+  // Grounding: send a host folder path; the daemon ingests it and grounds cues in
+  // it. (A path, not a native picker — the daemon reads its own filesystem.)
+  function setCorpusStatus(text, cls) {
+    const el = $("corpus-status");
+    el.textContent = text;
+    el.className = cls || "";
+  }
+  function loadCorpus() {
+    const path = $("corpus-path").value.trim();
+    if (!path || !sock || sock.readyState !== 1) return;
+    sock.send(JSON.stringify({ v: 0, type: "set_corpus", path }));
+    setCorpusStatus("loading…", "");
+  }
+  $("corpus-load").addEventListener("click", loadCorpus);
+  $("corpus-path").addEventListener("keydown", (e) => { if (e.key === "Enter") loadCorpus(); });
 
   // Best-effort PWA service worker (ignored if unavailable).
   if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});

@@ -51,8 +51,11 @@ Non-fatal core-side problem the surface should show (device lost, model load fai
 { "v":0, "type":"set_consent", "disclosed":true }          // user announced the assistant
 { "v":0, "type":"dismiss", "prompt_id":"p7" }              // user dismissed a prompt
 { "v":0, "type":"hint", "text":"focus on pricing" }        // steer the suggestion engine
+{ "v":0, "type":"set_corpus", "path":"/home/me/thesis" }   // ground cues in a host folder (RAG)
 { "v":0, "type":"ack" }                                     // keepalive
 ```
+
+`set_corpus` carries a **host-side** path (the core reads its own filesystem; local-first, so surfaces send a path, not uploaded files). The core replies with a `corpus_loaded` event (`{ chunks, sources, path }`) on success, or an `error` (`code:"corpus_load_failed"`) on failure.
 
 ## Design rules (load-bearing)
 
@@ -64,4 +67,4 @@ Non-fatal core-side problem the surface should show (device lost, model load fai
 
 ## Phase 0 subset
 
-The core emits `transcript.partial`, `transcript.final` (with real `stt_latency_ms`), `prompt` (suggestion engine), `state` (heartbeat with real `capturing` + `consent_disclosed`), and `error` (e.g. `audio_device_lost`, `suggest_unavailable`). On the uplink, the core consumes `set_consent` (drives the `consent_disclosed` reported in `state`); `dismiss`/`hint`/`ack` are accepted and logged but not yet acted on.
+The core emits `transcript.partial`, `transcript.final` (with real `stt_latency_ms`), `prompt` (suggestion engine), `state` (heartbeat with real `capturing` + `consent_disclosed`), `error` (e.g. `audio_device_lost`, `suggest_unavailable`, `corpus_load_failed`), and `corpus_loaded`. On the uplink, the core consumes `set_consent` (drives `consent_disclosed`) and `set_corpus` (loads a retrieval corpus at runtime); `dismiss`/`hint`/`ack` are accepted and logged but not yet acted on.

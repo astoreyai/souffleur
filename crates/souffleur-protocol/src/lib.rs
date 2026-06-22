@@ -146,15 +146,37 @@ pub enum Event {
         message: String,
         fatal: bool,
     },
+    /// A retrieval corpus finished loading (in response to [`Control::SetCorpus`]
+    /// or `--corpus`); cues are now grounded in it.
+    CorpusLoaded {
+        #[serde(rename = "v", default = "default_version")]
+        version: u8,
+        t: u64,
+        path: String,
+        chunks: u32,
+        sources: u32,
+    },
 }
 
 /// A surface -> core control message (optional uplink).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Control {
-    SetConsent { disclosed: bool },
-    Dismiss { prompt_id: String },
-    Hint { text: String },
+    SetConsent {
+        disclosed: bool,
+    },
+    Dismiss {
+        prompt_id: String,
+    },
+    Hint {
+        text: String,
+    },
+    /// Load (or replace) the retrieval corpus from a directory on the host. The
+    /// path is server-side: the core reads its own filesystem (local-first), so
+    /// surfaces send a path, not uploaded files.
+    SetCorpus {
+        path: String,
+    },
     Ack,
 }
 
@@ -227,6 +249,10 @@ mod tests {
 
         let a: Control = serde_json::from_str(r#"{"type":"ack"}"#).unwrap();
         assert!(matches!(a, Control::Ack));
+
+        let sc: Control =
+            serde_json::from_str(r#"{"type":"set_corpus","path":"/home/a/thesis"}"#).unwrap();
+        assert!(matches!(sc, Control::SetCorpus { path } if path == "/home/a/thesis"));
     }
 
     #[test]

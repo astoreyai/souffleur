@@ -106,6 +106,14 @@ cargo run --bin souffleur-core -- --mode duplex --corpus ~/dissertation
 # the embedder honours $OLLAMA_URL, same as the suggestion backend.
 ```
 
+You can also set or change the corpus **at runtime from the phone surface** — type a host folder path
+into the grounding bar and hit *Ground* (it sends a `set_corpus` uplink; the core replies `corpus_loaded`).
+It's a path field, not a native picker: the core reads its own filesystem (local-first).
+
+**Persistence:** embeddings are cached to `~/.cache/souffleur/` keyed by file mtime+size+model, so an
+unchanged corpus is not re-embedded on the next launch — only changed/new files are. (Brute-force
+in-memory cosine retrieval; no external vector DB.)
+
 Privacy: the corpus stays on the machine with the local backend. With a cloud backend the retrieved
 text is transmitted too, so it rides the same consent gate as the transcript. Grounding quality
 tracks the generation model — a capable model (Haiku/Gemini, or local `qwen2.5:32b`) cites retrieved

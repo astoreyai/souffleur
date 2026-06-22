@@ -210,9 +210,9 @@ fn emit(tx: &broadcast::Sender<String>, print: bool, ev: &Event) {
 /// A capture channel: its speaker, audio stream, and optional device-alive flag.
 type Channel = (Speaker, Receiver<Vec<f32>>, Option<Arc<AtomicBool>>);
 
-/// (turn-sender that channels push confirmed turns into, suggestion-worker handle).
+/// (command-sender that channels/surfaces push into, suggestion-worker handle).
 type SuggestionWorker = (
-    crossbeam_channel::Sender<(String, String)>,
+    crossbeam_channel::Sender<WorkerMsg>,
     Option<std::thread::JoinHandle<()>>,
 );
 
@@ -258,7 +258,7 @@ fn channel_loop(
     rx: Receiver<Vec<f32>>,
     mut streamer: StreamingStt,
     tx: broadcast::Sender<String>,
-    sug_tx: crossbeam_channel::Sender<(String, String)>,
+    sug_tx: crossbeam_channel::Sender<WorkerMsg>,
     t0: Instant,
     print: bool,
     shared: Arc<Shared>,
@@ -267,7 +267,7 @@ fn channel_loop(
 ) {
     let handle = |ev: &Event, tx: &broadcast::Sender<String>| {
         if let Event::TranscriptFinal { speaker, text, .. } = ev {
-            let _ = sug_tx.send((speaker.to_string(), text.clone()));
+            let _ = sug_tx.send(WorkerMsg::Turn(speaker.to_string(), text.clone()));
         }
         emit(tx, print, ev);
     };
@@ -301,25 +301,106 @@ fn channel_loop(
     }
 }
 
-/// Suggestion worker: debounce confirmed turns, ask the LLM, emit prompt events.
-/// Resilient: on repeated failure it emits one Event::Error (so surfaces know
-/// coaching went down) and periodically re-checks so it can recover.
+/// A message to the suggestion worker: a confirmed transcript turn, or a request
+/// to (re)load the retrieval corpus from a host directory.
+enum WorkerMsg {
+    Turn(String, String),
+    LoadCorpus(String),
+}
+
+/// Ingest a corpus directory into the engine, emitting `CorpusLoaded` on success
+/// or a non-fatal `Error` on failure (so a bad path from a surface never crashes
+/// the daemon).
+fn load_corpus_into(
+    engine: &mut SuggestionEngine,
+    path: &str,
+    embed_model: &str,
+    retrieve_k: usize,
+    tx: &broadcast::Sender<String>,
+    print: bool,
+    t0: Instant,
+) {
+    match souffleur_engine::corpus::Corpus::ingest_model(std::path::Path::new(path), embed_model) {
+        Ok(corpus) => {
+            let (chunks, sources) = (corpus.len() as u32, corpus.sources() as u32);
+            engine.set_corpus(corpus);
+            engine.set_retrieve_k(retrieve_k);
+            eprintln!(
+                "[corpus] loaded {chunks} chunks from {sources} files via {embed_model} ({path})"
+            );
+            emit(
+                tx,
+                print,
+                &Event::CorpusLoaded {
+                    version: PROTOCOL_VERSION,
+                    t: now_ms(t0),
+                    path: path.to_string(),
+                    chunks,
+                    sources,
+                },
+            );
+        }
+        Err(e) => {
+            eprintln!("[corpus] load failed: {e:#}");
+            emit(
+                tx,
+                print,
+                &Event::Error {
+                    version: PROTOCOL_VERSION,
+                    t: now_ms(t0),
+                    code: "corpus_load_failed".into(),
+                    message: format!("could not load corpus {path}: {e}"),
+                    fatal: false,
+                },
+            );
+        }
+    }
+}
+
+/// Suggestion worker: debounce confirmed turns, ask the LLM, emit prompt events,
+/// and apply runtime corpus loads. Shutdown-aware (a lingering command sender
+/// can't keep it alive). Resilient: on repeated failure it emits one Event::Error
+/// (so surfaces know coaching went down) and periodically re-checks to recover.
+#[allow(clippy::too_many_arguments)]
 fn suggestion_worker(
     mut engine: SuggestionEngine,
-    rx: crossbeam_channel::Receiver<(String, String)>,
+    rx: crossbeam_channel::Receiver<WorkerMsg>,
     tx: broadcast::Sender<String>,
     t0: Instant,
     print: bool,
     shared: Arc<Shared>,
+    embed_model: String,
+    retrieve_k: usize,
 ) {
     let cloud = engine.is_cloud();
     let mut degraded = false;
     let mut fails = 0u32;
     let mut consent_warned = false;
-    while let Ok((sp, txt)) = rx.recv() {
-        engine.push_turn(&sp, &txt);
-        while let Ok((s2, t2)) = rx.try_recv() {
-            engine.push_turn(&s2, &t2);
+    loop {
+        if shared.shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        let msg = match rx.recv_timeout(Duration::from_millis(150)) {
+            Ok(m) => m,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        match msg {
+            WorkerMsg::LoadCorpus(path) => {
+                load_corpus_into(&mut engine, &path, &embed_model, retrieve_k, &tx, print, t0);
+                continue;
+            }
+            WorkerMsg::Turn(sp, txt) => engine.push_turn(&sp, &txt),
+        }
+        // Drain queued messages: batch turns (debounce) and apply any corpus load.
+        loop {
+            match rx.try_recv() {
+                Ok(WorkerMsg::Turn(s2, t2)) => engine.push_turn(&s2, &t2),
+                Ok(WorkerMsg::LoadCorpus(path)) => {
+                    load_corpus_into(&mut engine, &path, &embed_model, retrieve_k, &tx, print, t0)
+                }
+                Err(_) => break,
+            }
         }
 
         let consent = shared.consent_disclosed.load(Ordering::Relaxed);
@@ -410,6 +491,7 @@ async fn handle_client(
     tx: broadcast::Sender<String>,
     shared: Arc<Shared>,
     token: Option<Arc<String>>,
+    corpus_cmd: Option<crossbeam_channel::Sender<WorkerMsg>>,
 ) {
     let peer = stream
         .peer_addr()
@@ -480,6 +562,16 @@ async fn handle_client(
                         Control::Dismiss { prompt_id } => {
                             eprintln!("[ws] {peer} dismiss {prompt_id}")
                         }
+                        Control::SetCorpus { path } => {
+                            if let Some(cmd) = &corpus_cmd {
+                                eprintln!("[ws] {peer} set_corpus {path}");
+                                let _ = cmd.send(WorkerMsg::LoadCorpus(path));
+                            } else {
+                                eprintln!(
+                                    "[ws] {peer} set_corpus ignored (suggestions disabled): {path}"
+                                );
+                            }
+                        }
                         Control::Ack => {}
                     }
                 }
@@ -529,7 +621,7 @@ fn spawn_suggestion(
     t0: Instant,
     shared: &Arc<Shared>,
 ) -> Result<SuggestionWorker> {
-    let (sug_tx, sug_rx) = crossbeam_channel::unbounded::<(String, String)>();
+    let (sug_tx, sug_rx) = crossbeam_channel::unbounded::<WorkerMsg>();
     if cfg.no_suggest {
         eprintln!("[suggest] disabled (--no-suggest)");
         return Ok((sug_tx, None));
@@ -574,9 +666,22 @@ fn spawn_suggestion(
     let tx = tx.clone();
     let print = cfg.print_stdout;
     let shared = shared.clone();
+    let embed_model = cfg.embed_model.clone();
+    let retrieve_k = cfg.retrieve_k;
     let handle = std::thread::Builder::new()
         .name("souffleur-suggest".into())
-        .spawn(move || suggestion_worker(engine, sug_rx, tx, t0, print, shared))
+        .spawn(move || {
+            suggestion_worker(
+                engine,
+                sug_rx,
+                tx,
+                t0,
+                print,
+                shared,
+                embed_model,
+                retrieve_k,
+            )
+        })
         .context("spawn suggestion worker")?;
     Ok((sug_tx, Some(handle)))
 }
@@ -587,6 +692,7 @@ fn spawn_accept_loop(
     tx: broadcast::Sender<String>,
     shared: Arc<Shared>,
     token: Option<Arc<String>>,
+    corpus_cmd: Option<crossbeam_channel::Sender<WorkerMsg>>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -597,6 +703,7 @@ fn spawn_accept_loop(
                         tx.clone(),
                         shared.clone(),
                         token.clone(),
+                        corpus_cmd.clone(),
                     ));
                 }
                 Err(e) => {
@@ -627,7 +734,7 @@ fn spawn_capture(
     cfg: &Config,
     stt: Arc<Stt>,
     tx: &broadcast::Sender<String>,
-    sug_tx: &crossbeam_channel::Sender<(String, String)>,
+    sug_tx: &crossbeam_channel::Sender<WorkerMsg>,
     t0: Instant,
     shared: &Arc<Shared>,
     notify: &Arc<Notify>,
@@ -800,6 +907,8 @@ async fn main() -> Result<()> {
     let token = cfg.token.clone().map(Arc::new);
 
     let (sug_tx, suggest_handle) = spawn_suggestion(&cfg, &tx, t0, &shared)?;
+    // Surfaces can load a corpus at runtime only if a worker exists to hold it.
+    let corpus_cmd = suggest_handle.as_ref().map(|_| sug_tx.clone());
 
     // Bind + accept connections first, so surfaces can attach before capture.
     let listener = TcpListener::bind(&cfg.bind)
@@ -809,7 +918,7 @@ async fn main() -> Result<()> {
     if !is_loopback_bind(&cfg.bind) {
         eprintln!("[core] WARNING: bound to a non-loopback address; token auth REQUIRED, transcript leaves this host on the LAN");
     }
-    spawn_accept_loop(listener, tx.clone(), shared.clone(), token);
+    spawn_accept_loop(listener, tx.clone(), shared.clone(), token, corpus_cmd);
 
     // Optionally hold capture until a surface is watching (don't coach to nobody).
     if cfg.wait_surface {
