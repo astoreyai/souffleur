@@ -221,29 +221,32 @@ type CaptureHandles = (Vec<std::thread::JoinHandle<()>>, Vec<Arc<AtomicBool>>);
 
 /// Build the capture channels for the configured mode.
 fn build_channels(cfg: &Config) -> Result<Vec<Channel>> {
-    Ok(match &cfg.mode {
-        Mode::Mic => {
-            let (rx, alive) = source::spawn_mic()?;
-            vec![(Speaker::Me, rx, Some(alive))]
-        }
-        Mode::Monitor => vec![(
+    use source::{AudioSource, MicSource, MonitorSource, WavSource};
+    let mic = || Box::new(MicSource) as Box<dyn AudioSource>;
+    let monitor = || {
+        Box::new(MonitorSource {
+            name: cfg.monitor.clone(),
+        }) as Box<dyn AudioSource>
+    };
+    // Each mode is a list of (speaker, source); the source decides its own alive flag.
+    let plan: Vec<(Speaker, Box<dyn AudioSource>)> = match &cfg.mode {
+        Mode::Mic => vec![(Speaker::Me, mic())],
+        Mode::Monitor => vec![(Speaker::Them, monitor())],
+        Mode::Wav(p) => vec![(
             Speaker::Them,
-            source::spawn_monitor(cfg.monitor.clone())?,
-            None,
+            Box::new(WavSource {
+                path: p.clone(),
+                chunk_ms: 100,
+            }),
         )],
-        Mode::Wav(p) => vec![(Speaker::Them, source::spawn_wav(p, 100)?, None)],
-        Mode::Duplex => {
-            let (mrx, alive) = source::spawn_mic()?;
-            vec![
-                (Speaker::Me, mrx, Some(alive)),
-                (
-                    Speaker::Them,
-                    source::spawn_monitor(cfg.monitor.clone())?,
-                    None,
-                ),
-            ]
-        }
-    })
+        Mode::Duplex => vec![(Speaker::Me, mic()), (Speaker::Them, monitor())],
+    };
+    let mut channels = Vec::with_capacity(plan.len());
+    for (speaker, src) in plan {
+        let (rx, alive) = src.spawn()?;
+        channels.push((speaker, rx, alive));
+    }
+    Ok(channels)
 }
 
 /// Per-channel loop: pull audio -> streaming STT -> emit; forward finals to the

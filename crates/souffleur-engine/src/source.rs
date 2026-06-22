@@ -1,11 +1,14 @@
 //! Audio sources, all normalized to 16 kHz mono f32 chunks on a channel.
 //!
-//! - [`spawn_mic`]: live default-input capture (the "me" channel).
-//! - [`spawn_monitor`]: live system-audio loopback via PulseAudio `parec` on a
-//!   `*.monitor` source (the "them" channel on this Linux dev box; the real
-//!   targets on the user's machine are macOS Core Audio taps / Windows WASAPI).
-//! - [`spawn_wav`]: a real WAV streamed in realtime-paced chunks (for tests and
-//!   the file source).
+//! [`AudioSource`] is the capture seam: every impl produces the same
+//! `(Receiver, alive?)` stream, so the daemon wires channels uniformly and a new
+//! platform is a new impl, not a rewrite of the channel plumbing.
+//!
+//! - [`MicSource`]: live default-input capture (the "me" channel; cpal).
+//! - [`MonitorSource`]: live system-audio loopback (the "them" channel). Linux
+//!   PulseAudio `parec` on a `*.monitor` source today; a macOS Core Audio tap or
+//!   Windows WASAPI loopback slots in here as another `AudioSource` impl.
+//! - [`WavSource`]: a real WAV streamed in realtime-paced chunks (tests + file).
 //!
 //! Every chunk is real captured/decoded audio — never synthesized.
 
@@ -20,9 +23,56 @@ use std::time::Duration;
 
 const SR: u32 = 16_000;
 
+/// A 16 kHz mono capture stream plus an optional device-alive flag. The flag is
+/// `Some` only for live hardware that can fail mid-session (the mic); files and
+/// the loopback stream signal end-of-audio by closing the channel.
+pub type CaptureStream = (Receiver<Vec<f32>>, Option<Arc<AtomicBool>>);
+
+/// A capture source. Implementors own their platform specifics; the daemon only
+/// sees [`CaptureStream`]. This is the cross-platform seam (mirror of the
+/// `SuggestBackend` trait for LLMs).
+pub trait AudioSource {
+    fn spawn(self: Box<Self>) -> Result<CaptureStream>;
+}
+
+/// Live default microphone (the "me" channel).
+pub struct MicSource;
+
+/// System-audio loopback (the "them" channel). Linux/PulseAudio via `parec`;
+/// the extension point for macOS Core Audio / Windows WASAPI loopback.
+pub struct MonitorSource {
+    /// Explicit monitor source name, or `None` for the default sink's monitor.
+    pub name: Option<String>,
+}
+
+/// A real WAV streamed in realtime-paced chunks.
+pub struct WavSource {
+    pub path: String,
+    pub chunk_ms: u64,
+}
+
+impl AudioSource for MicSource {
+    fn spawn(self: Box<Self>) -> Result<CaptureStream> {
+        let (rx, alive) = spawn_mic()?;
+        Ok((rx, Some(alive)))
+    }
+}
+
+impl AudioSource for MonitorSource {
+    fn spawn(self: Box<Self>) -> Result<CaptureStream> {
+        Ok((spawn_monitor(self.name)?, None))
+    }
+}
+
+impl AudioSource for WavSource {
+    fn spawn(self: Box<Self>) -> Result<CaptureStream> {
+        Ok((spawn_wav(&self.path, self.chunk_ms)?, None))
+    }
+}
+
 /// Live microphone, resampled to 16 kHz mono. Returns the chunk receiver and an
 /// `alive` flag the daemon polls — it flips to `false` if the device fails.
-pub fn spawn_mic() -> Result<(Receiver<Vec<f32>>, Arc<AtomicBool>)> {
+fn spawn_mic() -> Result<(Receiver<Vec<f32>>, Arc<AtomicBool>)> {
     let (dev_rx, info, alive) = audio::open_default_mic()?;
     eprintln!(
         "[source:mic] {} Hz, {} ch (default input) -> 16k mono",
@@ -61,7 +111,7 @@ pub fn default_monitor_name() -> Result<String> {
 }
 
 /// Live system-audio loopback via `parec` on a monitor source (16 kHz mono f32).
-pub fn spawn_monitor(monitor: Option<String>) -> Result<Receiver<Vec<f32>>> {
+fn spawn_monitor(monitor: Option<String>) -> Result<Receiver<Vec<f32>>> {
     let monitor = match monitor {
         Some(m) => m,
         None => default_monitor_name()?,
@@ -120,7 +170,7 @@ pub fn spawn_monitor(monitor: Option<String>) -> Result<Receiver<Vec<f32>>> {
 }
 
 /// Stream a real WAV in realtime-paced chunks at 16 kHz mono.
-pub fn spawn_wav(path: &str, chunk_ms: u64) -> Result<Receiver<Vec<f32>>> {
+fn spawn_wav(path: &str, chunk_ms: u64) -> Result<Receiver<Vec<f32>>> {
     let mut reader = hound::WavReader::open(path).with_context(|| format!("open wav {path}"))?;
     let spec = reader.spec();
     let samples: Vec<f32> = match spec.sample_format {
