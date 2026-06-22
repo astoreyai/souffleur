@@ -102,6 +102,8 @@ documents (e.g. *"Per [methods.tex]: N=412"*).
 
 ```bash
 cargo run --bin souffleur-core -- --mode duplex --corpus ~/dissertation
+# tunables: --embed-model <name> (default nomic-embed-text) · --retrieve-k <n> (default 3)
+# the embedder honours $OLLAMA_URL, same as the suggestion backend.
 ```
 
 Privacy: the corpus stays on the machine with the local backend. With a cloud backend the retrieved

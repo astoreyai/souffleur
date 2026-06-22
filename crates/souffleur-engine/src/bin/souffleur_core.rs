@@ -52,6 +52,8 @@ struct Config {
     wait_surface: bool,
     token: Option<String>,
     corpus: Option<String>,
+    embed_model: String,
+    retrieve_k: usize,
 }
 
 /// Shared daemon state read by the heartbeat and written by capture/consent paths.
@@ -93,6 +95,8 @@ fn parse_args() -> Result<Option<Config>> {
     let mut wait_surface = false;
     let mut listen_lan = false;
     let mut corpus: Option<String> = None;
+    let mut embed_model = "nomic-embed-text".to_string();
+    let mut retrieve_k: usize = 3;
     let mut token: Option<String> = std::env::var("SOUFFLEUR_TOKEN")
         .ok()
         .filter(|s| !s.is_empty());
@@ -123,6 +127,14 @@ fn parse_args() -> Result<Option<Config>> {
             "--listen-lan" => listen_lan = true,
             "--token" => token = Some(args.next().context("--token")?),
             "--corpus" => corpus = Some(args.next().context("--corpus")?),
+            "--embed-model" => embed_model = args.next().context("--embed-model")?,
+            "--retrieve-k" => {
+                retrieve_k = args
+                    .next()
+                    .context("--retrieve-k")?
+                    .parse()
+                    .context("--retrieve-k must be a positive integer")?
+            }
             other => return Err(anyhow!("unknown arg: {other}")),
         }
     }
@@ -177,6 +189,8 @@ fn parse_args() -> Result<Option<Config>> {
         wait_surface,
         token,
         corpus,
+        embed_model,
+        retrieve_k,
     }))
 }
 
@@ -526,14 +540,20 @@ fn spawn_suggestion(
     };
     let mut engine = SuggestionEngine::new(backend, SuggestConfig::default());
     if let Some(dir) = &cfg.corpus {
-        let corpus = souffleur_engine::corpus::Corpus::ingest(std::path::Path::new(dir))
-            .with_context(|| format!("ingest --corpus {dir}"))?;
+        let corpus = souffleur_engine::corpus::Corpus::ingest_model(
+            std::path::Path::new(dir),
+            &cfg.embed_model,
+        )
+        .with_context(|| format!("ingest --corpus {dir}"))?;
         eprintln!(
-            "[corpus] {} chunks from {} files in {dir} (cues will be grounded in your documents)",
+            "[corpus] {} chunks from {} files in {dir} via {} (top-{} per cue)",
             corpus.len(),
-            corpus.sources()
+            corpus.sources(),
+            cfg.embed_model,
+            cfg.retrieve_k
         );
         engine.set_corpus(corpus);
+        engine.set_retrieve_k(cfg.retrieve_k);
     }
     let bname = engine.backend_name().to_string();
     let is_cloud = engine.is_cloud();

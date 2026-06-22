@@ -13,10 +13,15 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 const DEFAULT_EMBED_MODEL: &str = "nomic-embed-text";
 const MAX_CHUNK_CHARS: usize = 900; // a passage-sized chunk
 const MIN_CHUNK_CHARS: usize = 40; // drop trivial fragments
+
+/// The Ollama base URL, honoring `$OLLAMA_URL` so embeddings hit the same server
+/// as the [`crate::suggest::OllamaBackend`] by default.
+pub fn default_ollama_url() -> String {
+    std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".into())
+}
 
 /// One embedded passage from the corpus.
 pub struct Chunk {
@@ -103,9 +108,15 @@ pub fn chunk_text(text: &str) -> Vec<String> {
 
 impl Corpus {
     /// Ingest every `.md`/`.txt`/`.text`/`.tex` file under `dir` (recursively),
-    /// chunk and embed each, using the default local Ollama endpoint.
+    /// chunk and embed each, using `$OLLAMA_URL` and the default embed model.
     pub fn ingest(dir: &Path) -> Result<Self> {
-        Self::ingest_with(dir, DEFAULT_OLLAMA_URL, DEFAULT_EMBED_MODEL)
+        Self::ingest_with(dir, &default_ollama_url(), DEFAULT_EMBED_MODEL)
+    }
+
+    /// Like [`ingest`](Self::ingest) but with a caller-chosen embedding model
+    /// (URL still from `$OLLAMA_URL`).
+    pub fn ingest_model(dir: &Path, model: &str) -> Result<Self> {
+        Self::ingest_with(dir, &default_ollama_url(), model)
     }
 
     /// Ingest against an explicit embedding endpoint/model. Errors if no readable

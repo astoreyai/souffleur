@@ -526,6 +526,12 @@ impl SuggestionEngine {
         self.corpus = Some(corpus);
     }
 
+    /// Number of corpus chunks to retrieve per suggestion (default 3). A no-op
+    /// `0` is clamped to 1 so an attached corpus always contributes.
+    pub fn set_retrieve_k(&mut self, k: usize) {
+        self.retrieve_k = k.max(1);
+    }
+
     pub fn backend_name(&self) -> &str {
         self.backend.name()
     }
